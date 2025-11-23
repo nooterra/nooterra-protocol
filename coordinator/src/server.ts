@@ -5,6 +5,7 @@ import { z } from "zod";
 import { v4 as uuidv4 } from "uuid";
 import pino from "pino";
 import { pool, migrate } from "./db.js";
+import fetch from "node-fetch";
 
 dotenv.config();
 
@@ -90,6 +91,36 @@ const settleSchema = z.object({
     .optional(),
 });
 
+type WebhookPayload = Record<string, any>;
+type WebhookTarget = { target_url: string; event: string };
+
+async function dispatchWebhooks(taskId: string, event: string, payload: WebhookPayload) {
+  const res = await pool.query<WebhookTarget>(
+    `select target_url, event from webhooks where task_id = $1 and event = $2`,
+    [taskId, event]
+  );
+  const targets = res.rows;
+  for (const t of targets) {
+    // basic retry: 3 attempts with backoff
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        await fetch(t.target_url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-nooterra-event": t.event },
+          body: JSON.stringify(payload),
+        });
+        break;
+      } catch (err) {
+        const delay = Math.pow(2, attempt) * 500;
+        await new Promise((resolve) => setTimeout(resolve, delay));
+        if (attempt === 2) {
+          console.error("webhook failed", t.target_url, err);
+        }
+      }
+    }
+  }
+}
+
 app.post("/v1/tasks/publish", { preHandler: [rateLimitGuard, apiGuard] }, async (request, reply) => {
   const parsed = publishSchema.safeParse(request.body);
   if (!parsed.success) {
@@ -108,6 +139,8 @@ app.post("/v1/tasks/publish", { preHandler: [rateLimitGuard, apiGuard] }, async 
       [taskId, webhookUrl, "task.updated"]
     );
   }
+  // fire task.created webhooks (none yet, placeholder for future listeners)
+  void dispatchWebhooks(taskId, "task.created", { taskId, description, requirements, budget, deadline });
   return reply.send({ taskId });
 });
 
@@ -141,6 +174,7 @@ app.post("/v1/tasks/:id/bid", { preHandler: [rateLimitGuard, apiGuard] }, async 
     [taskId]
   );
 
+  void dispatchWebhooks(taskId, "bid.received", { taskId, agentDid, amount, etaMs });
   return reply.send({ ok: true });
 });
 
@@ -181,6 +215,7 @@ app.post("/v1/settle/:id", { preHandler: [rateLimitGuard, apiGuard] }, async (re
     );
   }
   await pool.query(`update tasks set status = 'settled' where id = $1`, [taskId]);
+  void dispatchWebhooks(taskId, "settlement.finalized", { taskId, payouts });
   return reply.send({ ok: true, paid: payouts });
 });
 
