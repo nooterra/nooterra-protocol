@@ -79,6 +79,17 @@ const bidSchema = z.object({
   etaMs: z.number().int().positive().optional(),
 });
 
+const settleSchema = z.object({
+  payouts: z
+    .array(
+      z.object({
+        agentDid: z.string(),
+        amount: z.number().nonnegative(),
+      })
+    )
+    .optional(),
+});
+
 app.post("/v1/tasks/publish", { preHandler: [rateLimitGuard, apiGuard] }, async (request, reply) => {
   const parsed = publishSchema.safeParse(request.body);
   if (!parsed.success) {
@@ -151,20 +162,26 @@ app.get("/v1/tasks/:id", { preHandler: [rateLimitGuard, apiGuard] }, async (requ
 });
 
 app.post("/v1/settle/:id", { preHandler: [rateLimitGuard, apiGuard] }, async (request, reply) => {
+  const parse = settleSchema.safeParse(request.body || {});
+  if (!parse.success) {
+    return reply.status(400).send({ error: parse.error.flatten(), message: "Invalid payload" });
+  }
   const taskId = (request.params as any).id;
   const task = await pool.query(`select winner_did, budget from tasks where id = $1`, [taskId]);
   if (!task.rowCount) return reply.status(404).send({ error: "Task not found" });
   const winner = task.rows[0].winner_did;
   if (!winner) return reply.status(400).send({ error: "No winner selected" });
   const budget = task.rows[0].budget || 0;
-  // simple credits ledger
-  await pool.query(
-    `insert into balances (agent_did, credits) values ($1, $2)
-     on conflict (agent_did) do update set credits = balances.credits + excluded.credits, updated_at = now()`,
-    [winner, budget]
-  );
+  const payouts = parse.data.payouts || [{ agentDid: winner, amount: budget }];
+  for (const p of payouts) {
+    await pool.query(
+      `insert into balances (agent_did, credits) values ($1, $2)
+       on conflict (agent_did) do update set credits = balances.credits + excluded.credits, updated_at = now()`,
+      [p.agentDid, p.amount]
+    );
+  }
   await pool.query(`update tasks set status = 'settled' where id = $1`, [taskId]);
-  return reply.send({ ok: true, paid: budget, agent: winner });
+  return reply.send({ ok: true, paid: payouts });
 });
 
 app.get("/health", async (_req, reply) => {
