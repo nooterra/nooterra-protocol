@@ -19,6 +19,16 @@ await app.register(cors, { origin: true });
 
 await migrate();
 
+// request/trace id propagation
+app.addHook("onRequest", async (request, reply) => {
+  const rid =
+    (request.headers["x-request-id"] as string | undefined) ||
+    (request.headers["x-correlation-id"] as string | undefined) ||
+    uuidv4();
+  request.headers["x-request-id"] = rid;
+  reply.header("x-request-id", rid);
+});
+
 const rateBucket = new Map<string, { count: number; resetAt: number }>();
 const rateLimitGuard = async (request: Req, reply: Rep) => {
   const ip =
@@ -49,7 +59,7 @@ const apiGuard = async (request: Req, reply: Rep) => {
 
 const publishSchema = z.object({
   requesterDid: z.string().optional(),
-  description: z.string().min(5),
+  description: z.string().min(5).max(500),
   requirements: z.record(z.any()).optional(),
   budget: z.number().optional(),
   deadline: z.string().datetime().optional(),
@@ -126,7 +136,14 @@ app.get("/v1/tasks/:id", { preHandler: [rateLimitGuard, apiGuard] }, async (requ
   return reply.send({ task: task.rows[0], bids: bids.rows });
 });
 
-app.get("/health", async (_req, reply) => reply.send({ ok: true }));
+app.get("/health", async (_req, reply) => {
+  try {
+    await pool.query("select 1");
+    return reply.send({ ok: true });
+  } catch (err: any) {
+    return reply.status(503).send({ ok: false, error: err.message || "Unhealthy" });
+  }
+});
 
 app.setErrorHandler((err, _req, reply) => {
   app.log.error({ err });
