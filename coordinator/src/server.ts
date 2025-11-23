@@ -74,10 +74,14 @@ const rateLimitGuard = async (request: Req, reply: Rep) => {
 };
 
 const apiGuard = async (request: Req, reply: Rep) => {
-  if (!API_KEY) return;
-  const provided = request.headers["x-api-key"];
-  if (provided !== API_KEY) {
-    return reply.status(401).send({ error: "Unauthorized" });
+  const method = request.method?.toUpperCase() || "";
+  const isWrite = ["POST", "PUT", "PATCH", "DELETE"].includes(method);
+  if (!API_KEY && !isWrite) return;
+  if (API_KEY && isWrite) {
+    const provided = request.headers["x-api-key"];
+    if (provided !== API_KEY) {
+      return reply.status(401).send({ error: "Unauthorized" });
+    }
   }
 };
 
