@@ -3,6 +3,7 @@ import cors from "@fastify/cors";
 import dotenv from "dotenv";
 import { z } from "zod";
 import { v4 as uuidv4 } from "uuid";
+import pino from "pino";
 import { pool, migrate } from "./db.js";
 
 dotenv.config();
@@ -10,12 +11,18 @@ dotenv.config();
 const API_KEY = process.env.COORDINATOR_API_KEY;
 const RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_MAX || 60);
 const RATE_LIMIT_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS || 60_000);
+const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
 
 type Req = import("fastify").FastifyRequest;
 type Rep = import("fastify").FastifyReply;
 
-const app = Fastify({ logger: true });
-await app.register(cors, { origin: true });
+const logger = pino({
+  level: process.env.LOG_LEVEL || "info",
+  transport: process.env.NODE_ENV === "production" ? undefined : { target: "pino-pretty" },
+});
+
+const app = Fastify({ logger });
+await app.register(cors, { origin: CORS_ORIGIN });
 
 await migrate();
 
