@@ -33,6 +33,24 @@ export async function migrate() {
   `);
 
   await pool.query(`
+    create table if not exists balances (
+      agent_did text primary key,
+      credits numeric default 0,
+      updated_at timestamptz default now()
+    );
+  `);
+
+  await pool.query(`
+    create table if not exists webhooks (
+      id serial primary key,
+      task_id uuid,
+      target_url text not null,
+      event text not null,
+      created_at timestamptz default now()
+    );
+  `);
+
+  await pool.query(`
     create index if not exists bids_task_idx on bids(task_id);
   `);
 }

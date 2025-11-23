@@ -62,6 +62,7 @@ const publishSchema = z.object({
   description: z.string().min(5).max(500),
   requirements: z.record(z.any()).optional(),
   budget: z.number().optional(),
+  webhookUrl: z.string().url().optional(),
   deadline: z.string().datetime().optional(),
 });
 
@@ -76,13 +77,19 @@ app.post("/v1/tasks/publish", { preHandler: [rateLimitGuard, apiGuard] }, async 
   if (!parsed.success) {
     return reply.status(400).send({ error: parsed.error.flatten(), message: "Invalid payload" });
   }
-  const { requesterDid, description, requirements, budget, deadline } = parsed.data;
+  const { requesterDid, description, requirements, budget, deadline, webhookUrl } = parsed.data;
   const taskId = uuidv4();
   await pool.query(
     `insert into tasks (id, requester_did, description, requirements, budget, deadline)
      values ($1, $2, $3, $4, $5, $6)`,
     [taskId, requesterDid || null, description, requirements || null, budget || null, deadline || null]
   );
+  if (webhookUrl) {
+    await pool.query(
+      `insert into webhooks (task_id, target_url, event) values ($1, $2, $3)`,
+      [taskId, webhookUrl, "task.updated"]
+    );
+  }
   return reply.send({ taskId });
 });
 
@@ -136,6 +143,23 @@ app.get("/v1/tasks/:id", { preHandler: [rateLimitGuard, apiGuard] }, async (requ
   return reply.send({ task: task.rows[0], bids: bids.rows });
 });
 
+app.post("/v1/settle/:id", { preHandler: [rateLimitGuard, apiGuard] }, async (request, reply) => {
+  const taskId = (request.params as any).id;
+  const task = await pool.query(`select winner_did, budget from tasks where id = $1`, [taskId]);
+  if (!task.rowCount) return reply.status(404).send({ error: "Task not found" });
+  const winner = task.rows[0].winner_did;
+  if (!winner) return reply.status(400).send({ error: "No winner selected" });
+  const budget = task.rows[0].budget || 0;
+  // simple credits ledger
+  await pool.query(
+    `insert into balances (agent_did, credits) values ($1, $2)
+     on conflict (agent_did) do update set credits = balances.credits + excluded.credits, updated_at = now()`,
+    [winner, budget]
+  );
+  await pool.query(`update tasks set status = 'settled' where id = $1`, [taskId]);
+  return reply.send({ ok: true, paid: budget, agent: winner });
+});
+
 app.get("/health", async (_req, reply) => {
   try {
     await pool.query("select 1");
@@ -146,7 +170,8 @@ app.get("/health", async (_req, reply) => {
 });
 
 app.setErrorHandler((err, _req, reply) => {
-  app.log.error({ err });
+  const rid = (_req as any)?.headers?.["x-request-id"];
+  app.log.error({ err, request_id: rid });
   const status = (err as any).statusCode || 500;
   return reply.status(status).send({
     error: err.message,
