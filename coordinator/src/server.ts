@@ -22,7 +22,10 @@ const logger = pino({
   transport: process.env.NODE_ENV === "production" ? undefined : { target: "pino-pretty" },
 });
 
-const app = Fastify({ logger });
+const app = Fastify({
+  logger,
+  bodyLimit: 512 * 1024, // 512kb
+});
 await app.register(cors, { origin: CORS_ORIGIN });
 
 await migrate();
