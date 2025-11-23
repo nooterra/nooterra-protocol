@@ -1,0 +1,5 @@
+[
+  { "id": "f1", "route": "SFO-LIS", "price": 1240, "co2_kg": 980, "duration_h": 13.5 },
+  { "id": "f2", "route": "SFO-JFK-LIS", "price": 980, "co2_kg": 1050, "duration_h": 15.2 },
+  { "id": "f3", "route": "SFO-MAD-LIS", "price": 1105, "co2_kg": 920, "duration_h": 14.1 }
+]

@@ -1,0 +1,5 @@
+[
+  { "id": "h1", "name": "LX Boutique", "price": 210, "walk_score": 92, "safety": 0.91 },
+  { "id": "h2", "name": "Alfama Views", "price": 185, "walk_score": 88, "safety": 0.89 },
+  { "id": "h3", "name": "Tejo Riverside", "price": 240, "walk_score": 90, "safety": 0.93 }
+]

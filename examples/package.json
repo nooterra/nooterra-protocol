@@ -1,0 +1,16 @@
+{
+  "name": "nooterra-examples",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "coldchain": "tsx coldchain/run_demo.ts",
+    "travel": "tsx travel-coalition/run_demo.ts"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "^20.11.19",
+    "tsx": "^4.19.2",
+    "typescript": "^5.4.0"
+  }
+}

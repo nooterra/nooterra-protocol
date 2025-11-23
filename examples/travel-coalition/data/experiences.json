@@ -1,0 +1,5 @@
+[
+  { "id": "x1", "name": "Surf Day (Carcavelos)", "price": 140, "duration_h": 6 },
+  { "id": "x2", "name": "Setúbal Wine Tour", "price": 180, "duration_h": 8 },
+  { "id": "x3", "name": "Alfama Food Walk", "price": 120, "duration_h": 4 }
+]

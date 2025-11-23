@@ -1,0 +1,5 @@
+[
+  { "id": "wh1", "name": "Bay Cold Storage", "distance_mi": 22, "price_usd": 275, "eta_min": 58 },
+  { "id": "wh2", "name": "Peninsula Pharma Vault", "distance_mi": 31, "price_usd": 350, "eta_min": 41 },
+  { "id": "wh3", "name": "North Bay Cryo", "distance_mi": 45, "price_usd": 190, "eta_min": 73 }
+]
