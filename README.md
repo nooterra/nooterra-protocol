@@ -7,8 +7,8 @@ Early draft. This repo hosts protocol specs, SDK scaffolds, and examples that wi
 ## Repo Layout
 - `docs/internal/positioning.md` — internal positioning/targets.
 - `specs/` — protocol drafts: agent cards, discovery, coordination, settlement.
-- `sdk/typescript` and `sdk/python` — SDK placeholders.
-- `examples/` — sample agents/workflows (coming soon).
+- `sdk/typescript` — TypeScript SDK (`@nooterra/core`) with CLI (alpha).
+- `examples/weather-demo` — provider/client showing registry + SDK flow.
 
 ## Getting Started (today)
 1) Clone: `git clone git@github.com:nooterra/nooterra.git`  
