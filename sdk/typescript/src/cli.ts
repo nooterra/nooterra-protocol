@@ -11,12 +11,12 @@ Usage:
   nooterra register <desc>    Register a demo agent with one capability description
   nooterra search <query>     Search for agents by intent
 Environment:
-  NOOTERRA_API (default http://localhost:3001)
+  NOOTERRA_API (default https://api.nooterra.ai)
 `);
 }
 
 async function main() {
-  const apiUrl = process.env.NOOTERRA_API || "http://localhost:3001";
+  const apiUrl = process.env.NOOTERRA_API || "https://api.nooterra.ai";
   const client = new Nooterra({ apiUrl });
 
   try {

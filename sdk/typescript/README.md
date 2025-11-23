@@ -28,4 +28,4 @@ npx nooterra identity          # generates DID + keypair
 npx nooterra register "I parse PDFs"
 npx nooterra search "parse PDFs"
 ```
-Uses `NOOTERRA_API` (default `http://localhost:3001`).
+Uses `NOOTERRA_API` (default `https://api.nooterra.ai`).

@@ -60,7 +60,7 @@ export class Nooterra {
   private apiKey?: string;
 
   constructor(config: { apiUrl?: string; apiKey?: string } = {}) {
-    this.apiUrl = config.apiUrl || "http://localhost:3001";
+    this.apiUrl = config.apiUrl || "https://api.nooterra.ai";
     this.apiKey = config.apiKey;
   }
 
