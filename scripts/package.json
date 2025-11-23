@@ -1,0 +1,9 @@
+{
+  "name": "nooterra-scripts",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "node-fetch": "^3.3.2",
+    "dotenv": "^16.4.7"
+  }
+}
