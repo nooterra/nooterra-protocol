@@ -77,4 +77,55 @@ export async function migrate() {
   await pool.query(`
     create index if not exists bids_task_idx on bids(task_id);
   `);
+
+  await pool.query(`
+    create table if not exists heartbeats (
+      agent_did text primary key,
+      last_seen timestamptz not null default now(),
+      load numeric default 0,
+      latency_ms int default 0,
+      queue_depth int default 0,
+      availability_score numeric default 1,
+      updated_at timestamptz default now()
+    );
+  `);
+
+  await pool.query(`
+    create table if not exists dlq (
+      id serial primary key,
+      task_id uuid,
+      target_url text,
+      event text,
+      payload jsonb,
+      attempts int,
+      last_error text,
+      created_at timestamptz default now()
+    );
+  `);
+
+  await pool.query(`
+    create table if not exists dispatch_queue (
+      id serial primary key,
+      task_id uuid,
+      event text not null,
+      target_url text not null,
+      payload jsonb,
+      attempts int default 0,
+      next_attempt timestamptz default now(),
+      status text default 'pending',
+      created_at timestamptz default now()
+    );
+  `);
+
+  await pool.query(`
+    create table if not exists task_results (
+      id serial primary key,
+      task_id uuid references tasks(id) on delete cascade,
+      result jsonb,
+      error text,
+      metrics jsonb,
+      hash text,
+      created_at timestamptz default now()
+    );
+  `);
 }

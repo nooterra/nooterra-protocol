@@ -17,6 +17,9 @@ const RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_MAX || 60);
 const RATE_LIMIT_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS || 60_000);
 const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "";
+const HEARTBEAT_TTL_MS = Number(process.env.HEARTBEAT_TTL_MS || 60_000);
+const DISPATCH_BATCH_MS = Number(process.env.DISPATCH_BATCH_MS || 1000);
+const RETRY_BACKOFFS_MS = [0, 1000, 5000, 30000];
 
 type Req = import("fastify").FastifyRequest;
 type Rep = import("fastify").FastifyReply;
@@ -121,6 +124,24 @@ const feedbackSchema = z.object({
   comment: z.string().max(500).optional(),
 });
 
+const heartbeatSchema = z.object({
+  did: z.string(),
+  load: z.number().min(0).max(1).default(0),
+  latency_ms: z.number().int().nonnegative().default(0),
+  queue_depth: z.number().int().nonnegative().default(0),
+});
+
+const resultSchema = z.object({
+  result: z.any().optional(),
+  error: z.string().optional(),
+  metrics: z
+    .object({
+      latency_ms: z.number().int().nonnegative().optional(),
+      tokens_used: z.number().int().nonnegative().optional(),
+    })
+    .optional(),
+});
+
 type WebhookPayload = Record<string, any>;
 type WebhookTarget = { target_url: string; event: string };
 
@@ -145,6 +166,45 @@ async function pushReputation(agentDid: string, reputation: number) {
   }
 }
 
+async function recordHeartbeat(agentDid: string) {
+  await pool.query(
+    `insert into heartbeats (agent_did, last_seen, load, latency_ms, queue_depth, availability_score, updated_at)
+     values ($1, now(), 0, 0, 0, 1, now())
+     on conflict (agent_did) do update set last_seen = now(), updated_at = now()`,
+    [agentDid]
+  );
+}
+
+async function getAvailabilityScore(agentDid: string) {
+  const res = await pool.query<{ availability_score: number | null; last_seen: Date }>(
+    `select availability_score, last_seen from heartbeats where agent_did = $1`,
+    [agentDid]
+  );
+  if (!res.rowCount) return 0;
+  const { availability_score, last_seen } = res.rows[0];
+  const stale = Date.now() - new Date(last_seen).getTime() > HEARTBEAT_TTL_MS * 2;
+  return stale ? 0 : Number(availability_score || 0);
+}
+
+function computeAvailability(load: number, queueDepth: number, latencyMs: number) {
+  const normalizedLatency = Math.min(1, latencyMs / 1000);
+  const score = 1 - load * 0.4 - queueDepth * 0.2 - normalizedLatency * 0.4;
+  return Math.max(0, Math.min(1, score));
+}
+
+const eventSubscribers = new Set<any>();
+function emitEvent(event: string, data: any) {
+  const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+  for (const res of eventSubscribers) {
+    try {
+      res.write(payload);
+    } catch {
+      // drop dead subscribers
+      eventSubscribers.delete(res);
+    }
+  }
+}
+
 async function dispatchWebhooks(taskId: string, event: string, payload: WebhookPayload) {
   const res = await pool.query<WebhookTarget>(
     `select target_url, event from webhooks where task_id = $1 and event = $2`,
@@ -158,32 +218,12 @@ async function dispatchWebhooks(taskId: string, event: string, payload: WebhookP
     eventId: uuidv4(),
     data: payload,
   };
-  const bodyString = JSON.stringify(basePayload);
-  const signature = signPayload(bodyString);
   for (const t of targets) {
-    // basic retry: 3 attempts with backoff
-    for (let attempt = 0; attempt < 3; attempt++) {
-      try {
-        const headers: Record<string, string> = {
-          "Content-Type": "application/json",
-          "x-nooterra-event": t.event,
-          "x-nooterra-event-id": basePayload.eventId,
-        };
-        if (signature) headers["x-nooterra-signature"] = signature;
-        await fetch(t.target_url, {
-          method: "POST",
-          headers,
-          body: bodyString,
-        });
-        break;
-      } catch (err) {
-        const delay = Math.pow(2, attempt) * 500;
-        await new Promise((resolve) => setTimeout(resolve, delay));
-        if (attempt === 2) {
-          console.error("webhook failed", t.target_url, err);
-        }
-      }
-    }
+    await pool.query(
+      `insert into dispatch_queue (task_id, event, target_url, payload, attempts, next_attempt, status)
+       values ($1, $2, $3, $4, 0, now(), 'pending')`,
+      [taskId, t.event, t.target_url, basePayload]
+    );
   }
 }
 
@@ -205,7 +245,8 @@ app.post("/v1/tasks/publish", { preHandler: [rateLimitGuard, apiGuard] }, async 
       [taskId, webhookUrl, "task.updated"]
     );
   }
-  // fire task.created webhooks (none yet, placeholder for future listeners)
+  emitEvent("TASK_PUBLISHED", { taskId, description, budget });
+  // enqueue webhooks for future listeners
   void dispatchWebhooks(taskId, "task.created", { taskId, description, requirements, budget, deadline });
   return reply.send({ taskId });
 });
@@ -217,6 +258,8 @@ app.post("/v1/tasks/:id/bid", { preHandler: [rateLimitGuard, apiGuard] }, async 
   }
   const taskId = (request.params as any).id;
   const { agentDid, amount, etaMs } = parsed.data;
+
+  void recordHeartbeat(agentDid);
 
   const task = await pool.query(`select status from tasks where id = $1`, [taskId]);
   if (!task.rowCount) return reply.status(404).send({ error: "Task not found" });
@@ -241,6 +284,7 @@ app.post("/v1/tasks/:id/bid", { preHandler: [rateLimitGuard, apiGuard] }, async 
   );
 
   void dispatchWebhooks(taskId, "bid.received", { taskId, agentDid, amount, etaMs });
+  emitEvent("AGENT_BID", { taskId, agentDid, amount });
   return reply.send({ ok: true });
 });
 
@@ -273,6 +317,17 @@ app.post("/v1/tasks/:id/settle", { preHandler: [rateLimitGuard, apiGuard] }, asy
   if (!winner) return reply.status(400).send({ error: "No winner selected" });
   const budget = task.rows[0].budget || 0;
   const payouts = parse.data.payouts || [{ agentDid: winner, amount: budget }];
+
+  // optional result processing
+  const maybeResult = resultSchema.safeParse((request.body as any)?.result ? { result: (request.body as any).result, error: (request.body as any).error, metrics: (request.body as any).metrics } : (request.body as any));
+  if (maybeResult.success && (maybeResult.data.result || maybeResult.data.error)) {
+    const hash = crypto.createHash("sha256").update(JSON.stringify(maybeResult.data.result || maybeResult.data.error)).digest("hex");
+    await pool.query(
+      `insert into task_results (task_id, result, error, metrics, hash) values ($1, $2, $3, $4, $5)`,
+      [taskId, maybeResult.data.result ?? null, maybeResult.data.error ?? null, maybeResult.data.metrics ?? null, hash]
+    );
+  }
+
   for (const p of payouts) {
     await pool.query(
       `insert into balances (agent_did, credits) values ($1, $2)
@@ -286,6 +341,7 @@ app.post("/v1/tasks/:id/settle", { preHandler: [rateLimitGuard, apiGuard] }, asy
   }
   await pool.query(`update tasks set status = 'settled' where id = $1`, [taskId]);
   void dispatchWebhooks(taskId, "settlement.finalized", { taskId, payouts });
+  emitEvent("TASK_SETTLED", { taskId, payouts });
   return reply.send({ ok: true, paid: payouts });
 });
 
@@ -338,6 +394,48 @@ app.get("/v1/tasks/:id/feedback", { preHandler: [rateLimitGuard, apiGuard] }, as
     [taskId]
   );
   return reply.send({ taskId, feedback: rows.rows });
+});
+
+app.post("/v1/heartbeat", { preHandler: [rateLimitGuard, apiGuard] }, async (request, reply) => {
+  const parsed = heartbeatSchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.status(400).send({ error: parsed.error.flatten(), message: "Invalid payload" });
+  }
+  const { did, load, latency_ms, queue_depth } = parsed.data;
+  const score = computeAvailability(load, queue_depth, latency_ms);
+  await pool.query(
+    `insert into heartbeats (agent_did, last_seen, load, latency_ms, queue_depth, availability_score, updated_at)
+     values ($1, now(), $2, $3, $4, $5, now())
+     on conflict (agent_did) do update set last_seen = now(), load = $2, latency_ms = $3, queue_depth = $4, availability_score = $5, updated_at = now()`,
+    [did, load, latency_ms, queue_depth, score]
+  );
+  emitEvent("AGENT_HEARTBEAT", { agentDid: did, score });
+  return reply.send({ ok: true, availability: score });
+});
+
+app.get("/v1/agents/:id/health", { preHandler: [rateLimitGuard, apiGuard] }, async (request, reply) => {
+  const agentDid = (request.params as any).id;
+  const res = await pool.query(
+    `select agent_did, last_seen, load, latency_ms, queue_depth, availability_score from heartbeats where agent_did = $1`,
+    [agentDid]
+  );
+  if (!res.rowCount) return reply.status(404).send({ error: "Not found" });
+  const row = res.rows[0];
+  const stale = Date.now() - new Date(row.last_seen).getTime() > HEARTBEAT_TTL_MS * 2;
+  return reply.send({ ...row, stale });
+});
+
+app.get("/v1/events/stream", async (_req, reply) => {
+  reply.raw.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive",
+  });
+  reply.raw.write("\n");
+  eventSubscribers.add(reply.raw);
+  _req.raw.on("close", () => {
+    eventSubscribers.delete(reply.raw);
+  });
 });
 
 app.get("/health", async (_req, reply) => {
