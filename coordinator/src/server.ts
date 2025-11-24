@@ -176,8 +176,8 @@ async function recordHeartbeat(agentDid: string) {
 }
 
 async function getAvailabilityScore(agentDid: string) {
-  const res = await pool.query<{ availability_score: number | null; last_seen: Date }>(
-    `select availability_score, last_seen from heartbeats where agent_did = $1`,
+  const res = await pool.query<{ availability_score: number | null; last_seen: Date; latency_ms: number | null; load: number | null; queue_depth: number | null }>(
+    `select availability_score, last_seen, latency_ms, load, queue_depth from heartbeats where agent_did = $1`,
     [agentDid]
   );
   if (!res.rowCount) return 0;
@@ -271,16 +271,21 @@ app.post("/v1/tasks/:id/bid", { preHandler: [rateLimitGuard, apiGuard] }, async 
   );
 
   // Update winner to lowest amount (tie-break: earliest)
+  const ttlMs = HEARTBEAT_TTL_MS * 2;
   await pool.query(
     `update tasks t set winner_did = sub.agent_did
      from (
-       select agent_did from bids
-       where task_id = $1
-       order by amount nulls last, created_at asc
+       select b.agent_did
+       from bids b
+       left join heartbeats h on h.agent_did = b.agent_did
+       where b.task_id = $1
+         and coalesce(h.availability_score,0) >= 0.3
+         and (h.last_seen is null or now() - h.last_seen < ($2::int || ' milliseconds')::interval)
+       order by b.amount nulls last, coalesce(h.latency_ms, 999999) asc, b.created_at asc
        limit 1
      ) sub
      where t.id = $1`,
-    [taskId]
+    [taskId, ttlMs]
   );
 
   void dispatchWebhooks(taskId, "bid.received", { taskId, agentDid, amount, etaMs });
