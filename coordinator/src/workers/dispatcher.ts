@@ -25,6 +25,12 @@ async function processOnce() {
     [now]
   );
 
+  if (rows.length === 0) {
+    return;
+  }
+
+  console.log(`[dispatcher] found ${rows.length} jobs at ${now.toISOString()}`);
+
   for (const job of rows) {
     const attempt = job.attempts ?? 0;
     const bodyString = JSON.stringify(job.payload);
@@ -77,4 +83,3 @@ main().catch((err) => {
   console.error(err);
   process.exit(1);
 });
-
