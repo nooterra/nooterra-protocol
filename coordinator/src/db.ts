@@ -41,6 +41,28 @@ export async function migrate() {
   `);
 
   await pool.query(`
+    create table if not exists ledger (
+      id serial primary key,
+      agent_did text not null,
+      task_id uuid,
+      delta numeric not null,
+      meta jsonb,
+      created_at timestamptz default now()
+    );
+  `);
+
+  await pool.query(`
+    create table if not exists feedback (
+      id serial primary key,
+      task_id uuid,
+      agent_did text not null,
+      rating numeric check (rating >= 0 and rating <= 1),
+      comment text,
+      created_at timestamptz default now()
+    );
+  `);
+
+  await pool.query(`
     create table if not exists webhooks (
       id serial primary key,
       task_id uuid,

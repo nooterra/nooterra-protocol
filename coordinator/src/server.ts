@@ -11,6 +11,8 @@ import crypto from "crypto";
 dotenv.config();
 
 const API_KEY = process.env.COORDINATOR_API_KEY;
+const REGISTRY_URL = process.env.REGISTRY_URL || "";
+const REGISTRY_API_KEY = process.env.REGISTRY_API_KEY || "";
 const RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_MAX || 60);
 const RATE_LIMIT_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS || 60_000);
 const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
@@ -113,12 +115,34 @@ const settleSchema = z.object({
     .optional(),
 });
 
+const feedbackSchema = z.object({
+  agentDid: z.string(),
+  rating: z.number().min(0).max(1),
+  comment: z.string().max(500).optional(),
+});
+
 type WebhookPayload = Record<string, any>;
 type WebhookTarget = { target_url: string; event: string };
 
 function signPayload(body: string) {
   if (!WEBHOOK_SECRET) return null;
   return crypto.createHmac("sha256", WEBHOOK_SECRET).update(body).digest("hex");
+}
+
+async function pushReputation(agentDid: string, reputation: number) {
+  if (!REGISTRY_URL || !REGISTRY_API_KEY) return;
+  try {
+    await fetch(`${REGISTRY_URL}/v1/agent/reputation`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": REGISTRY_API_KEY,
+      },
+      body: JSON.stringify({ did: agentDid, reputation }),
+    });
+  } catch (err) {
+    app.log.error({ err, agentDid }, "Failed to push reputation to registry");
+  }
 }
 
 async function dispatchWebhooks(taskId: string, event: string, payload: WebhookPayload) {
@@ -255,10 +279,56 @@ app.post("/v1/tasks/:id/settle", { preHandler: [rateLimitGuard, apiGuard] }, asy
        on conflict (agent_did) do update set credits = balances.credits + excluded.credits, updated_at = now()`,
       [p.agentDid, p.amount]
     );
+    await pool.query(
+      `insert into ledger (agent_did, task_id, delta, meta) values ($1, $2, $3, $4)`,
+      [p.agentDid, taskId, p.amount, JSON.stringify({ reason: "settlement" })]
+    );
   }
   await pool.query(`update tasks set status = 'settled' where id = $1`, [taskId]);
   void dispatchWebhooks(taskId, "settlement.finalized", { taskId, payouts });
   return reply.send({ ok: true, paid: payouts });
+});
+
+app.get("/v1/balances/:agentDid", { preHandler: [rateLimitGuard, apiGuard] }, async (request, reply) => {
+  const agentDid = (request.params as any).agentDid;
+  const res = await pool.query(`select credits from balances where agent_did = $1`, [agentDid]);
+  const credits = res.rowCount ? res.rows[0].credits : 0;
+  return reply.send({ agentDid, credits });
+});
+
+app.get("/v1/ledger/:agentDid/history", { preHandler: [rateLimitGuard, apiGuard] }, async (request, reply) => {
+  const agentDid = (request.params as any).agentDid;
+  const limit = Math.min(100, Math.max(1, Number((request.query as any)?.limit || 50)));
+  const res = await pool.query(
+    `select id, task_id, delta, meta, created_at from ledger where agent_did = $1 order by created_at desc limit $2`,
+    [agentDid, limit]
+  );
+  return reply.send({ agentDid, history: res.rows });
+});
+
+app.post("/v1/tasks/:id/feedback", { preHandler: [rateLimitGuard, apiGuard] }, async (request, reply) => {
+  const parsed = feedbackSchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.status(400).send({ error: parsed.error.flatten(), message: "Invalid payload" });
+  }
+  const taskId = (request.params as any).id;
+  const task = await pool.query(`select id from tasks where id = $1`, [taskId]);
+  if (!task.rowCount) return reply.status(404).send({ error: "Task not found" });
+
+  const { agentDid, rating, comment } = parsed.data;
+  await pool.query(
+    `insert into feedback (task_id, agent_did, rating, comment) values ($1, $2, $3, $4)`,
+    [taskId, agentDid, rating, comment || null]
+  );
+
+  const avgRes = await pool.query<{ avg: string | null }>(
+    `select avg(rating) as avg from feedback where agent_did = $1`,
+    [agentDid]
+  );
+  const avg = avgRes.rows[0]?.avg ? Number(avgRes.rows[0].avg) : 0;
+  void pushReputation(agentDid, Math.max(0, Math.min(1, avg)));
+
+  return reply.send({ ok: true, agentDid, rating, reputation: avg });
 });
 
 app.get("/health", async (_req, reply) => {
