@@ -215,7 +215,7 @@ app.get("/v1/tasks/:id", { preHandler: [rateLimitGuard, apiGuard] }, async (requ
   return reply.send({ task: task.rows[0], bids: bids.rows });
 });
 
-app.post("/v1/settle/:id", { preHandler: [rateLimitGuard, apiGuard] }, async (request, reply) => {
+app.post("/v1/tasks/:id/settle", { preHandler: [rateLimitGuard, apiGuard] }, async (request, reply) => {
   const parse = settleSchema.safeParse(request.body || {});
   if (!parse.success) {
     return reply.status(400).send({ error: parse.error.flatten(), message: "Invalid payload" });
