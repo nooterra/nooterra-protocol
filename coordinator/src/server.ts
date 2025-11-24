@@ -7,6 +7,7 @@ import pino from "pino";
 import { pool, migrate } from "./db.js";
 import fetch from "node-fetch";
 import crypto from "crypto";
+import { validateOutputSchema } from "./validation.js";
 
 dotenv.config();
 
@@ -166,15 +167,6 @@ async function pushReputation(agentDid: string, reputation: number) {
   }
 }
 
-async function recordHeartbeat(agentDid: string) {
-  await pool.query(
-    `insert into heartbeats (agent_did, last_seen, load, latency_ms, queue_depth, availability_score, updated_at)
-     values ($1, now(), 0, 0, 0, 1, now())
-     on conflict (agent_did) do update set last_seen = now(), updated_at = now()`,
-    [agentDid]
-  );
-}
-
 async function getAvailabilityScore(agentDid: string) {
   const res = await pool.query<{ availability_score: number | null; last_seen: Date; latency_ms: number | null; load: number | null; queue_depth: number | null }>(
     `select availability_score, last_seen, latency_ms, load, queue_depth from heartbeats where agent_did = $1`,
@@ -259,7 +251,7 @@ app.post("/v1/tasks/:id/bid", { preHandler: [rateLimitGuard, apiGuard] }, async 
   const taskId = (request.params as any).id;
   const { agentDid, amount, etaMs } = parsed.data;
 
-  void recordHeartbeat(agentDid);
+  void recordHeartbeat(agentDid, 0, etaMs ?? 0, 0);
 
   const task = await pool.query(`select status from tasks where id = $1`, [taskId]);
   if (!task.rowCount) return reply.status(404).send({ error: "Task not found" });
@@ -326,11 +318,29 @@ app.post("/v1/tasks/:id/settle", { preHandler: [rateLimitGuard, apiGuard] }, asy
   // optional result processing
   const maybeResult = resultSchema.safeParse((request.body as any)?.result ? { result: (request.body as any).result, error: (request.body as any).error, metrics: (request.body as any).metrics } : (request.body as any));
   if (maybeResult.success && (maybeResult.data.result || maybeResult.data.error)) {
-    const hash = crypto.createHash("sha256").update(JSON.stringify(maybeResult.data.result || maybeResult.data.error)).digest("hex");
+    let hash = "";
+    let schemaValid = true;
+    let schemaErrors: any = null;
+    try {
+      hash = crypto.createHash("sha256").update(JSON.stringify(maybeResult.data.result || maybeResult.data.error)).digest("hex");
+      // validate against capability schema if available
+      const capabilityId = (request.body as any)?.capabilityId || "";
+      if (capabilityId && REGISTRY_URL) {
+        const validation = await validateOutputSchema(REGISTRY_URL, capabilityId, maybeResult.data.result ?? {});
+        schemaValid = validation.valid;
+        schemaErrors = validation.errors || null;
+      }
+    } catch (err) {
+      // ignore
+    }
     await pool.query(
       `insert into task_results (task_id, result, error, metrics, hash) values ($1, $2, $3, $4, $5)`,
-      [taskId, maybeResult.data.result ?? null, maybeResult.data.error ?? null, maybeResult.data.metrics ?? null, hash]
+      [taskId, maybeResult.data.result ?? null, maybeResult.data.error ?? null, maybeResult.data.metrics ?? null, hash || null]
     );
+    if (!schemaValid) {
+      emitEvent("TASK_RESULT_INVALID", { taskId, capabilityId: (request.body as any)?.capabilityId, errors: schemaErrors });
+      return reply.status(400).send({ error: "Result failed schema validation", details: schemaErrors });
+    }
   }
 
   for (const p of payouts) {
@@ -407,13 +417,7 @@ app.post("/v1/heartbeat", { preHandler: [rateLimitGuard, apiGuard] }, async (req
     return reply.status(400).send({ error: parsed.error.flatten(), message: "Invalid payload" });
   }
   const { did, load, latency_ms, queue_depth } = parsed.data;
-  const score = computeAvailability(load, queue_depth, latency_ms);
-  await pool.query(
-    `insert into heartbeats (agent_did, last_seen, load, latency_ms, queue_depth, availability_score, updated_at)
-     values ($1, now(), $2, $3, $4, $5, now())
-     on conflict (agent_did) do update set last_seen = now(), load = $2, latency_ms = $3, queue_depth = $4, availability_score = $5, updated_at = now()`,
-    [did, load, latency_ms, queue_depth, score]
-  );
+  const score = await recordHeartbeat(did, load, latency_ms, queue_depth);
   emitEvent("AGENT_HEARTBEAT", { agentDid: did, score });
   return reply.send({ ok: true, availability: score });
 });
@@ -467,3 +471,25 @@ const port = Number(process.env.PORT || 3002);
 app.listen({ port, host: "0.0.0.0" }).then(() => {
   app.log.info(`Coordinator running on ${port}`);
 });
+async function recordHeartbeat(agentDid: string, load: number, latencyMs: number, queueDepth: number) {
+  const score = computeAvailability(load, queueDepth, latencyMs);
+  await pool.query(
+    `insert into heartbeats (agent_did, last_seen, load, latency_ms, queue_depth, availability_score, updated_at)
+     values ($1, now(), $2, $3, $4, $5, now())
+     on conflict (agent_did) do update set last_seen = now(), load = $2, latency_ms = $3, queue_depth = $4, availability_score = $5, updated_at = now()`,
+    [agentDid, load, latencyMs, queueDepth, score]
+  );
+  // push availability to registry
+  if (REGISTRY_URL && REGISTRY_API_KEY) {
+    try {
+      await fetch(`${REGISTRY_URL}/v1/agent/availability`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-api-key": REGISTRY_API_KEY },
+        body: JSON.stringify({ did: agentDid, availability: score, last_seen: new Date().toISOString() }),
+      });
+    } catch (err) {
+      app.log.error({ err, agentDid }, "Failed to push availability to registry");
+    }
+  }
+  return score;
+}
