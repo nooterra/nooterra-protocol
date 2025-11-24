@@ -62,6 +62,8 @@ export async function migrate() {
     );
   `);
 
+  await pool.query(`create index if not exists feedback_task_idx on feedback(task_id);`);
+
   await pool.query(`
     create table if not exists webhooks (
       id serial primary key,

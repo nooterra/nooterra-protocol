@@ -331,6 +331,15 @@ app.post("/v1/tasks/:id/feedback", { preHandler: [rateLimitGuard, apiGuard] }, a
   return reply.send({ ok: true, agentDid, rating, reputation: avg });
 });
 
+app.get("/v1/tasks/:id/feedback", { preHandler: [rateLimitGuard, apiGuard] }, async (request, reply) => {
+  const taskId = (request.params as any).id;
+  const rows = await pool.query(
+    `select agent_did, rating, comment, created_at from feedback where task_id = $1 order by created_at desc`,
+    [taskId]
+  );
+  return reply.send({ taskId, feedback: rows.rows });
+});
+
 app.get("/health", async (_req, reply) => {
   try {
     await pool.query("select 1");
