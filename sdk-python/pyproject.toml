@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nooterra"
+version = "0.1.0"
+description = "Python SDK stub for Nooterra registry + coordinator APIs"
+authors = [{ name = "Nooterra", email = "hi@nooterra.ai" }]
+dependencies = ["requests>=2.31.0"]
+requires-python = ">=3.9"
+
+[project.urls]
+Homepage = "https://nooterra.ai"
+Repository = "https://github.com/nooterra/nooterra-protocol"
