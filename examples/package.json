@@ -5,10 +5,14 @@
   "type": "module",
   "scripts": {
     "coldchain": "tsx coldchain/run_demo.ts",
-    "travel": "tsx travel-coalition/run_demo.ts"
+    "travel": "tsx travel-coalition/run_demo.ts",
+    "langchain-agent": "tsx langchain-agent.ts"
   },
   "dependencies": {
-    "playwright": "^1.56.1"
+    "playwright": "^1.56.1",
+    "nooterra-core": "^0.1.0",
+    "nooterra-langchain-adapter": "^0.1.0",
+    "langchain": "^0.1.35"
   },
   "devDependencies": {
     "@types/node": "^20.11.19",
