@@ -1,4 +1,4 @@
-import { NooterraClient, DiscoveryResult } from "@nooterra/core";
+import { NooterraClient, DiscoveryResult } from "nooterra-core";
 
 type ToolCall = {
   name: string;

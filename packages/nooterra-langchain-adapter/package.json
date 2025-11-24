@@ -1,5 +1,5 @@
 {
-  "name": "@nooterra/langchain-adapter",
+  "name": "nooterra-langchain-adapter",
   "version": "0.1.0",
   "description": "Minimal LangChain-compatible tool wrapper for Nooterra",
   "type": "module",
@@ -12,7 +12,7 @@
     "access": "public"
   },
   "dependencies": {
-    "@nooterra/core": "0.1.0"
+    "nooterra-core": "0.1.0"
   },
   "devDependencies": {
     "typescript": "^5.4.0"

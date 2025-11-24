@@ -1,5 +1,5 @@
 {
-  "name": "@nooterra/core",
+  "name": "nooterra-core",
   "version": "0.1.0",
   "description": "TypeScript SDK for Nooterra registry and coordinator APIs",
   "type": "module",
