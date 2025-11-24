@@ -3,10 +3,14 @@
   "private": true,
   "type": "module",
   "dependencies": {
-    "node-fetch": "^3.3.2",
-    "dotenv": "^16.4.7"
+    "dotenv": "^16.4.7",
+    "node-fetch": "^3.3.2"
   },
   "scripts": {
-    "e2e": "node e2e-live.ts"
+    "e2e": "node e2e-live.mjs"
+  },
+  "devDependencies": {
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
   }
 }

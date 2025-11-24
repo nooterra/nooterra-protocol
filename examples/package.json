@@ -7,7 +7,9 @@
     "coldchain": "tsx coldchain/run_demo.ts",
     "travel": "tsx travel-coalition/run_demo.ts"
   },
-  "dependencies": {},
+  "dependencies": {
+    "playwright": "^1.56.1"
+  },
   "devDependencies": {
     "@types/node": "^20.11.19",
     "tsx": "^4.19.2",

@@ -6,6 +6,7 @@ import { v4 as uuidv4 } from "uuid";
 import pino from "pino";
 import { pool, migrate } from "./db.js";
 import fetch from "node-fetch";
+import crypto from "crypto";
 
 dotenv.config();
 
@@ -13,6 +14,7 @@ const API_KEY = process.env.COORDINATOR_API_KEY;
 const RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_MAX || 60);
 const RATE_LIMIT_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS || 60_000);
 const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "";
 
 type Req = import("fastify").FastifyRequest;
 type Rep = import("fastify").FastifyReply;
@@ -114,20 +116,40 @@ const settleSchema = z.object({
 type WebhookPayload = Record<string, any>;
 type WebhookTarget = { target_url: string; event: string };
 
+function signPayload(body: string) {
+  if (!WEBHOOK_SECRET) return null;
+  return crypto.createHmac("sha256", WEBHOOK_SECRET).update(body).digest("hex");
+}
+
 async function dispatchWebhooks(taskId: string, event: string, payload: WebhookPayload) {
   const res = await pool.query<WebhookTarget>(
     `select target_url, event from webhooks where task_id = $1 and event = $2`,
     [taskId, event]
   );
   const targets = res.rows;
+  const basePayload = {
+    event,
+    taskId,
+    timestamp: new Date().toISOString(),
+    eventId: uuidv4(),
+    data: payload,
+  };
+  const bodyString = JSON.stringify(basePayload);
+  const signature = signPayload(bodyString);
   for (const t of targets) {
     // basic retry: 3 attempts with backoff
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
+        const headers: Record<string, string> = {
+          "Content-Type": "application/json",
+          "x-nooterra-event": t.event,
+          "x-nooterra-event-id": basePayload.eventId,
+        };
+        if (signature) headers["x-nooterra-signature"] = signature;
         await fetch(t.target_url, {
           method: "POST",
-          headers: { "Content-Type": "application/json", "x-nooterra-event": t.event },
-          body: JSON.stringify(payload),
+          headers,
+          body: bodyString,
         });
         break;
       } catch (err) {
