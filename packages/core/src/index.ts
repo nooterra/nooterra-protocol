@@ -1,4 +1,4 @@
-import fetch from "node-fetch";
+import fetch, { type Response } from "node-fetch";
 
 export interface NooterraClientOptions {
   registryUrl: string;

@@ -8,6 +8,9 @@
   "scripts": {
     "build": "tsc -p tsconfig.json"
   },
+  "publishConfig": {
+    "access": "public"
+  },
   "dependencies": {
     "node-fetch": "^3.3.2"
   },

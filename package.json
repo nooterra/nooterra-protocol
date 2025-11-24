@@ -1,0 +1,14 @@
+{
+  "name": "nooterra-monorepo",
+  "private": true,
+  "version": "0.0.0",
+  "workspaces": [
+    "packages/core",
+    "packages/langchain-adapter"
+  ],
+  "scripts": {
+    "build": "npm run build -w @nooterra/core && npm run build -w @nooterra/langchain-adapter",
+    "publish:core": "npm publish -w @nooterra/core --access public",
+    "publish:adapter": "npm publish -w @nooterra/langchain-adapter --access public"
+  }
+}

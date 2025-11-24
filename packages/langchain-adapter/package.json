@@ -8,6 +8,9 @@
   "scripts": {
     "build": "tsc -p tsconfig.json"
   },
+  "publishConfig": {
+    "access": "public"
+  },
   "dependencies": {
     "@nooterra/core": "0.1.0"
   },
