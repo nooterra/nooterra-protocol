@@ -302,6 +302,18 @@ app.get("/v1/tasks/:id", { preHandler: [rateLimitGuard, apiGuard] }, async (requ
   return reply.send({ task: task.rows[0], bids: bids.rows });
 });
 
+app.get("/v1/tasks", { preHandler: [rateLimitGuard, apiGuard] }, async (request, reply) => {
+  const limit = Math.min(200, Math.max(1, Number((request.query as any)?.limit || 50)));
+  const rows = await pool.query(
+    `select id, description, status, winner_did, budget, created_at
+     from tasks
+     order by created_at desc
+     limit $1`,
+    [limit]
+  );
+  return reply.send({ tasks: rows.rows });
+});
+
 app.post("/v1/tasks/:id/settle", { preHandler: [rateLimitGuard, apiGuard] }, async (request, reply) => {
   const parse = settleSchema.safeParse(request.body || {});
   if (!parse.success) {
