@@ -117,6 +117,8 @@ export async function migrate() {
     );
   `);
 
+  await pool.query(`alter table dispatch_queue add column if not exists last_error text;`);
+
   await pool.query(`
     create table if not exists task_results (
       id serial primary key,
