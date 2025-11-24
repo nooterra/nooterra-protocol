@@ -234,7 +234,7 @@ app.post("/v1/tasks/publish", { preHandler: [rateLimitGuard, apiGuard] }, async 
   if (webhookUrl) {
     await pool.query(
       `insert into webhooks (task_id, target_url, event) values ($1, $2, $3)`,
-      [taskId, webhookUrl, "task.updated"]
+      [taskId, webhookUrl, "task.created"]
     );
   }
   emitEvent("TASK_PUBLISHED", { taskId, description, budget });
