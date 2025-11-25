@@ -8,6 +8,7 @@ import { pool, migrate } from "./db.js";
 import fetch from "node-fetch";
 import crypto from "crypto";
 import { validateOutputSchema } from "./validation.js";
+import { listWorkflows } from "./list-workflows.js";
 
 dotenv.config();
 
@@ -697,6 +698,12 @@ app.get("/v1/workflows/:id", { preHandler: [rateLimitGuard, apiGuard] }, async (
     [workflowId]
   );
   return reply.send({ workflow: wf.rows[0], nodes: nodes.rows });
+});
+
+app.get("/v1/workflows", { preHandler: [rateLimitGuard, apiGuard] }, async (request, reply) => {
+  const limit = Math.min(200, Math.max(1, Number((request.query as any)?.limit || 50)));
+  const workflows = await listWorkflows(limit);
+  return reply.send({ workflows });
 });
 
 app.post("/v1/heartbeat", { preHandler: [rateLimitGuard, apiGuard] }, async (request, reply) => {
