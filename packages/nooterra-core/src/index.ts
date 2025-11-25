@@ -38,6 +38,17 @@ export interface PublishOptions {
   deadline?: string;
 }
 
+export type NodeDef = {
+  capabilityId: string;
+  dependsOn?: string[];
+  payload?: Record<string, any>;
+};
+
+export type WorkflowDef = {
+  intent?: string;
+  nodes: Record<string, NodeDef>;
+};
+
 export interface BidOptions {
   agentDid: string;
   amount?: number;
@@ -171,5 +182,43 @@ export class NooterraClient {
       }
     );
     return this.handle(resp);
+  }
+
+  async workflow(def: WorkflowDef) {
+    validateWorkflow(def);
+    const resp = await fetch(`${this.coordinatorUrl}/v1/workflows/publish`, {
+      method: "POST",
+      headers: this.headers(this.coordinatorApiKey),
+      body: JSON.stringify(def),
+    });
+    return this.handle(resp) as Promise<{ workflowId: string; taskId: string; nodes: string[] }>;
+  }
+}
+
+function validateWorkflow(def: WorkflowDef) {
+  const nodes = def.nodes || {};
+  const names = Object.keys(nodes);
+  for (const [name, node] of Object.entries(nodes)) {
+    const deps = node.dependsOn || [];
+    if (deps.includes(name)) throw new Error(`Node ${name} depends on itself`);
+    deps.forEach((d) => {
+      if (!names.includes(d)) throw new Error(`Node ${name} depends on missing node ${d}`);
+    });
+  }
+  const visiting = new Set<string>();
+  const visited = new Set<string>();
+  const hasCycle = (n: string): boolean => {
+    if (visiting.has(n)) return true;
+    if (visited.has(n)) return false;
+    visiting.add(n);
+    for (const d of nodes[n].dependsOn || []) {
+      if (hasCycle(d)) return true;
+    }
+    visiting.delete(n);
+    visited.add(n);
+    return false;
+  };
+  for (const n of names) {
+    if (hasCycle(n)) throw new Error("Cycle detected in workflow DAG");
   }
 }
