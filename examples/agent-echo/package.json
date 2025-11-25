@@ -1,0 +1,12 @@
+{
+  "name": "nooterra-agent-echo",
+  "private": true,
+  "type": "module",
+  "version": "0.1.0",
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "dependencies": {
+    "@nooterra/core": "file:../../packages/nooterra-core"
+  }
+}

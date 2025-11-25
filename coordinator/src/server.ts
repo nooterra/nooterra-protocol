@@ -9,6 +9,7 @@ import fetch from "node-fetch";
 import crypto from "crypto";
 import { validateOutputSchema } from "./validation.js";
 import { listWorkflows } from "./list-workflows.js";
+import { startDispatcherLoop } from "./workers/dispatcher.js";
 
 dotenv.config();
 
@@ -23,6 +24,55 @@ const HEARTBEAT_TTL_MS = Number(process.env.HEARTBEAT_TTL_MS || 60_000);
 const DISPATCH_BATCH_MS = Number(process.env.DISPATCH_BATCH_MS || 1000);
 const RETRY_BACKOFFS_MS = [0, 1000, 5000, 30000];
 const DAG_MAX_ATTEMPTS = Number(process.env.DAG_MAX_ATTEMPTS || 3);
+const CRITICAL_CAPS = new Set<string>(["cap.customs.classify.v1"]);
+const MIN_REP_CRITICAL = 0.4;
+const FEEDBACK_WEIGHT = 0.2;
+
+async function computeLatencyMs(started: any, metrics?: any) {
+  if (metrics?.latency_ms != null) return Number(metrics.latency_ms);
+  if (started) {
+    const diff = Date.now() - new Date(started).getTime();
+    return diff > 0 ? diff : 0;
+  }
+  return 0;
+}
+
+async function updateAgentStatsAndRep(agentDid: string, success: boolean, latencyMs: number) {
+  if (!agentDid) return;
+  // update stats
+  const res = await pool.query(
+    `select tasks_success, tasks_failed, avg_latency_ms from agent_stats where agent_did = $1`,
+    [agentDid]
+  );
+  let successCount = res.rowCount ? Number(res.rows[0].tasks_success) : 0;
+  let failCount = res.rowCount ? Number(res.rows[0].tasks_failed) : 0;
+  let avgLatency = res.rowCount ? Number(res.rows[0].avg_latency_ms) : 0;
+  if (success) successCount += 1;
+  else failCount += 1;
+  const total = successCount + failCount;
+  const newAvg = total > 0 ? (avgLatency * (total - 1) + latencyMs) / total : latencyMs;
+
+  await pool.query(
+    `insert into agent_stats (agent_did, tasks_success, tasks_failed, avg_latency_ms, last_updated_at)
+     values ($1, $2, $3, $4, now())
+     on conflict (agent_did)
+     do update set tasks_success = $2, tasks_failed = $3, avg_latency_ms = $4, last_updated_at = now()`,
+    [agentDid, successCount, failCount, newAvg]
+  );
+
+  // compute simple rep: 0.7 * successRate + 0.3 * latencyScore
+  const successRate = (successCount + 1) / (successCount + failCount + 2);
+  const latencyScore = 1 / Math.log10((newAvg || 1) + 10); // ~0-1
+  const rep = Math.min(1, Math.max(0, 0.7 * successRate + 0.3 * latencyScore));
+
+  await pool.query(
+    `insert into agent_reputation (agent_did, reputation, last_updated_at)
+     values ($1, $2, now())
+     on conflict (agent_did) do update set reputation = EXCLUDED.reputation, last_updated_at = now()`,
+    [agentDid, rep]
+  );
+  await pool.query(`update agents set reputation = $1 where did = $2`, [rep, agentDid]);
+}
 
 type Req = import("fastify").FastifyRequest;
 type Rep = import("fastify").FastifyReply;
@@ -122,8 +172,12 @@ const settleSchema = z.object({
 });
 
 const feedbackSchema = z.object({
-  agentDid: z.string(),
-  rating: z.number().min(0).max(1),
+  workflowId: z.string().uuid().optional(),
+  nodeName: z.string().optional(),
+  toDid: z.string(),
+  quality: z.number().min(0).max(1).optional(),
+  latency: z.number().min(0).max(1).optional(),
+  reliability: z.number().min(0).max(1).optional(),
   comment: z.string().max(500).optional(),
 });
 
@@ -267,8 +321,8 @@ async function createWorkflow(intent: string | undefined, nodes: Record<string, 
   );
   for (const [name, node] of Object.entries(nodes)) {
     await pool.query(
-      `insert into task_nodes (id, workflow_id, name, capability_id, status, depends_on, payload, max_attempts)
-       values ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      `insert into task_nodes (id, workflow_id, name, capability_id, status, depends_on, payload, max_attempts, requires_verification)
+       values ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
       [
         uuidv4(),
         workflowId,
@@ -278,6 +332,7 @@ async function createWorkflow(intent: string | undefined, nodes: Record<string, 
         node.dependsOn,
         node.payload || {},
         DAG_MAX_ATTEMPTS,
+        CRITICAL_CAPS.has(node.capabilityId),
       ]
     );
   }
@@ -329,12 +384,20 @@ async function enqueueNode(node: any, workflowId: string) {
 
   // select the top agent for the capability (simple MVP selection)
   const agentRes = await pool.query(
-    `select a.did, a.endpoint from agents a
+    `select a.did, a.endpoint,
+            coalesce(ar.reputation, a.reputation, 0) as rep,
+            coalesce(hb.availability_score, 0) as avail
+     from agents a
      join capabilities c on c.agent_did = a.did
+     left join agent_reputation ar on ar.agent_did = a.did
+     left join heartbeats hb on hb.agent_did = a.did
      where c.capability_id = $1
-     order by coalesce(a.reputation,0) desc nulls last
+       and (hb.last_seen is null or hb.last_seen > now() - interval '${HEARTBEAT_TTL_MS} milliseconds')
+       and ($2::boolean = false or coalesce(ar.reputation, a.reputation, 0) >= $3)
+     order by coalesce(ar.reputation, a.reputation, 0) desc nulls last,
+              coalesce(hb.availability_score, 0) desc nulls last
      limit 1`,
-    [node.capability_id]
+    [node.capability_id, CRITICAL_CAPS.has(node.capability_id), MIN_REP_CRITICAL]
   );
   if (!agentRes.rowCount) {
     // no agent available; mark failed
@@ -343,15 +406,17 @@ async function enqueueNode(node: any, workflowId: string) {
     return;
   }
   const target = agentRes.rows[0].endpoint;
+  const agentDid = agentRes.rows[0].did;
   await pool.query(
     `insert into dispatch_queue (task_id, workflow_id, node_id, event, target_url, payload, attempts, next_attempt, status)
      values ($1, $2, $3, $4, $5, $6, 0, now(), 'pending')`,
     [taskId, workflowId, node.name, "node.dispatch", target, basePayload]
   );
 
-  await pool.query(`update task_nodes set status = 'dispatched', updated_at = now(), started_at = now() where id = $1`, [
-    node.id,
-  ]);
+  await pool.query(
+    `update task_nodes set status = 'dispatched', updated_at = now(), started_at = now(), agent_did = $2 where id = $1`,
+    [node.id, agentDid]
+  );
   emitEvent("NODE_DISPATCHED", { workflowId, nodeId: node.name, capabilityId: node.capability_id });
 }
 
@@ -536,40 +601,6 @@ app.get("/v1/ledger/:agentDid/history", { preHandler: [rateLimitGuard, apiGuard]
   return reply.send({ agentDid, history: res.rows });
 });
 
-app.post("/v1/tasks/:id/feedback", { preHandler: [rateLimitGuard, apiGuard] }, async (request, reply) => {
-  const parsed = feedbackSchema.safeParse(request.body);
-  if (!parsed.success) {
-    return reply.status(400).send({ error: parsed.error.flatten(), message: "Invalid payload" });
-  }
-  const taskId = (request.params as any).id;
-  const task = await pool.query(`select id from tasks where id = $1`, [taskId]);
-  if (!task.rowCount) return reply.status(404).send({ error: "Task not found" });
-
-  const { agentDid, rating, comment } = parsed.data;
-  await pool.query(
-    `insert into feedback (task_id, agent_did, rating, comment) values ($1, $2, $3, $4)`,
-    [taskId, agentDid, rating, comment || null]
-  );
-
-  const avgRes = await pool.query<{ avg: string | null }>(
-    `select avg(rating) as avg from feedback where agent_did = $1`,
-    [agentDid]
-  );
-  const avg = avgRes.rows[0]?.avg ? Number(avgRes.rows[0].avg) : 0;
-  void pushReputation(agentDid, Math.max(0, Math.min(1, avg)));
-
-  return reply.send({ ok: true, agentDid, rating, reputation: avg });
-});
-
-app.get("/v1/tasks/:id/feedback", { preHandler: [rateLimitGuard, apiGuard] }, async (request, reply) => {
-  const taskId = (request.params as any).id;
-  const rows = await pool.query(
-    `select agent_did, rating, comment, created_at from feedback where task_id = $1 order by created_at desc`,
-    [taskId]
-  );
-  return reply.send({ taskId, feedback: rows.rows });
-});
-
 // ---- Workflow endpoints ----
 app.post("/v1/workflows/publish", { preHandler: [rateLimitGuard, apiGuard] }, async (request, reply) => {
   const parsed = workflowPublishSchema.safeParse(request.body);
@@ -626,7 +657,8 @@ app.post("/v1/workflows/nodeResult", { preHandler: [rateLimitGuard, apiGuard] },
   }
   const { workflowId, nodeId, result, error, metrics } = parsed.data;
   const nodeRes = await pool.query(
-    `select id, capability_id, max_attempts, attempts from task_nodes where workflow_id = $1 and name = $2`,
+    `select id, capability_id, max_attempts, attempts, agent_did, started_at, requires_verification
+     from task_nodes where workflow_id = $1 and name = $2`,
     [workflowId, nodeId]
   );
   if (!nodeRes.rowCount) return reply.status(404).send({ error: "Node not found" });
@@ -649,7 +681,14 @@ app.post("/v1/workflows/nodeResult", { preHandler: [rateLimitGuard, apiGuard] },
 
   const newStatus = !schemaValid || error ? "failed" : "success";
   await pool.query(
-    `update task_nodes set status = $1, attempts = attempts + 1, result_hash = $2, result_payload = $3, finished_at = now(), updated_at = now() where id = $4`,
+    `update task_nodes
+       set status = $1,
+           attempts = attempts + 1,
+           result_hash = $2,
+           result_payload = $3,
+           finished_at = now(),
+           updated_at = now()
+     where id = $4`,
     [newStatus, hash || null, result ?? error ?? null, node.id]
   );
 
@@ -678,11 +717,88 @@ app.post("/v1/workflows/nodeResult", { preHandler: [rateLimitGuard, apiGuard] },
     await pool.query(`update workflows set status = 'running', updated_at = now() where id = $1`, [workflowId]);
   }
 
+  // update agent stats & reputation
+  const agentDid = node.agent_did || null;
+  const latencyMs = await computeLatencyMs(node.started_at, metrics);
+  await updateAgentStatsAndRep(agentDid, newStatus === "success", latencyMs);
+
+  // auto verification hook (minimal): if requires_verification and success, spawn verify node
+  if (newStatus === "success" && node.requires_verification) {
+    const capVerify = "cap.verify.generic.v1";
+    const verifyAvail = await pool.query(
+      `select 1 from capabilities where capability_id = $1 limit 1`,
+      [capVerify]
+    );
+    if (verifyAvail.rowCount) {
+      const verifyName = `verify_${nodeId}`;
+      await pool.query(
+        `insert into task_nodes (id, workflow_id, name, capability_id, status, depends_on, payload, max_attempts)
+         values ($1, $2, $3, $4, 'ready', $5, $6, $7)
+         on conflict do nothing`,
+        [
+          uuidv4(),
+          workflowId,
+          verifyName,
+          capVerify,
+          [nodeId],
+          { original_node: nodeId },
+          DAG_MAX_ATTEMPTS,
+        ]
+      );
+    }
+  }
+
   if (newStatus === "success") {
     await orchestrateWorkflow(workflowId);
   }
 
   return reply.send({ ok: true, status: newStatus, schemaValid, errors: schemaErrors });
+});
+
+app.post("/v1/feedback", { preHandler: [rateLimitGuard, apiGuard] }, async (request, reply) => {
+  const parsed = feedbackSchema.safeParse(request.body);
+  if (!parsed.success) return reply.status(400).send({ error: parsed.error.flatten() });
+  const body = parsed.data;
+  if (!body.quality && !body.latency && !body.reliability) {
+    return reply.status(400).send({ error: "At least one score (quality/latency/reliability) is required" });
+  }
+  const fromDid = (request.headers["x-agent-did"] as string) || null;
+  await pool.query(
+    `insert into feedback (workflow_id, node_name, to_did, from_did, quality, latency, reliability, comment, created_at)
+     values ($1,$2,$3,$4,$5,$6,$7,$8, now())`,
+    [body.workflowId || null, body.nodeName || null, body.toDid, fromDid, body.quality, body.latency, body.reliability, body.comment || null]
+  );
+
+  // light-touch rep bump: blend feedback average into reputation
+  const repRes = await pool.query(`select reputation from agents where did = $1`, [body.toDid]);
+  const currentRep = repRes.rowCount ? Number(repRes.rows[0].reputation || 0) : 0;
+  const scores = [body.quality, body.latency, body.reliability].filter((x) => x != null) as number[];
+  const feedbackScore = scores.length ? scores.reduce((a, b) => a + b, 0) / scores.length : 0;
+  const newRep = Math.min(1, Math.max(0, (1 - FEEDBACK_WEIGHT) * currentRep + FEEDBACK_WEIGHT * feedbackScore));
+  await pool.query(`update agents set reputation = $1 where did = $2`, [newRep, body.toDid]);
+  await pool.query(
+    `insert into agent_reputation (agent_did, reputation, last_updated_at)
+     values ($1, $2, now())
+     on conflict (agent_did) do update set reputation = EXCLUDED.reputation, last_updated_at = now()`,
+    [body.toDid, newRep]
+  );
+
+  return reply.send({ ok: true, reputation: newRep });
+});
+
+app.get("/v1/agents/:did/stats", { preHandler: [rateLimitGuard, apiGuard] }, async (request, reply) => {
+  const did = (request.params as any).did;
+  const stats = await pool.query(
+    `select a.did, coalesce(ar.reputation,a.reputation,0) as reputation,
+            s.tasks_success, s.tasks_failed, s.avg_latency_ms
+     from agents a
+     left join agent_stats s on s.agent_did = a.did
+     left join agent_reputation ar on ar.agent_did = a.did
+     where a.did = $1`,
+    [did]
+  );
+  if (!stats.rowCount) return reply.status(404).send({ error: "Not found" });
+  return reply.send(stats.rows[0]);
 });
 
 app.get("/v1/workflows/:id", { preHandler: [rateLimitGuard, apiGuard] }, async (request, reply) => {
@@ -693,7 +809,8 @@ app.get("/v1/workflows/:id", { preHandler: [rateLimitGuard, apiGuard] }, async (
   );
   if (!wf.rowCount) return reply.status(404).send({ error: "Not found" });
   const nodes = await pool.query(
-    `select name, capability_id, status, depends_on, attempts, max_attempts, result_hash, result_payload, started_at, finished_at, created_at, updated_at
+    `select name, capability_id, status, depends_on, attempts, max_attempts, result_hash, result_payload,
+            started_at, finished_at, created_at, updated_at, agent_did, requires_verification, verification_status, verified_by
      from task_nodes where workflow_id = $1 order by created_at asc`,
     [workflowId]
   );
@@ -765,6 +882,10 @@ app.setErrorHandler((err, _req, reply) => {
 const port = Number(process.env.PORT || 3002);
 app.listen({ port, host: "0.0.0.0" }).then(() => {
   app.log.info(`Coordinator running on ${port}`);
+  if (process.env.RUN_DISPATCHER === "true") {
+    startDispatcherLoop().catch((err) => app.log.error({ err }, "Dispatcher loop crashed"));
+    app.log.info("Dispatcher loop started in-process (RUN_DISPATCHER=true)");
+  }
 });
 async function recordHeartbeat(agentDid: string, load: number, latencyMs: number, queueDepth: number) {
   const score = computeAvailability(load, queueDepth, latencyMs);

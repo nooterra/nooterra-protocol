@@ -1,0 +1,14 @@
+{
+  "name": "nooterra-logistics-agents",
+  "private": true,
+  "type": "module",
+  "version": "0.1.0",
+  "scripts": {
+    "start:weather": "node weather-agent/server.mjs",
+    "start:customs": "node customs-agent/server.mjs",
+    "start:rail": "node rail-agent/server.mjs"
+  },
+  "dependencies": {
+    "@nooterra/core": "file:../../packages/nooterra-core"
+  }
+}

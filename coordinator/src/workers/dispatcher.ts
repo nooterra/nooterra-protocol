@@ -81,7 +81,13 @@ async function main() {
   }
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+export async function startDispatcherLoop() {
+  await main();
+}
+
+if (process.argv[1]?.includes("dispatcher")) {
+  main().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}
