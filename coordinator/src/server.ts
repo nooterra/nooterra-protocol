@@ -21,6 +21,7 @@ const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "";
 const HEARTBEAT_TTL_MS = Number(process.env.HEARTBEAT_TTL_MS || 60_000);
 const DISPATCH_BATCH_MS = Number(process.env.DISPATCH_BATCH_MS || 1000);
 const RETRY_BACKOFFS_MS = [0, 1000, 5000, 30000];
+const DAG_MAX_ATTEMPTS = Number(process.env.DAG_MAX_ATTEMPTS || 3);
 
 type Req = import("fastify").FastifyRequest;
 type Rep = import("fastify").FastifyReply;
@@ -143,6 +144,30 @@ const resultSchema = z.object({
     .optional(),
 });
 
+const workflowPublishSchema = z.object({
+  intent: z.string().optional(),
+  nodes: z.record(
+    z.object({
+      capabilityId: z.string(),
+      dependsOn: z.array(z.string()).optional(),
+      payload: z.record(z.any()).optional(),
+    })
+  ),
+});
+
+const nodeResultSchema = z.object({
+  workflowId: z.string(),
+  nodeId: z.string(),
+  result: z.any().optional(),
+  error: z.string().optional(),
+  metrics: z
+    .object({
+      latency_ms: z.number().int().nonnegative().optional(),
+      tokens_used: z.number().int().nonnegative().optional(),
+    })
+    .optional(),
+});
+
 type WebhookPayload = Record<string, any>;
 type WebhookTarget = { target_url: string; event: string };
 
@@ -216,6 +241,127 @@ async function dispatchWebhooks(taskId: string, event: string, payload: WebhookP
        values ($1, $2, $3, $4, 0, now(), 'pending')`,
       [taskId, t.event, t.target_url, basePayload]
     );
+  }
+}
+
+// ---- DAG helpers ----
+type WorkflowNode = {
+  name: string;
+  capabilityId: string;
+  dependsOn: string[];
+  payload?: Record<string, any>;
+};
+
+async function createWorkflow(intent: string | undefined, nodes: Record<string, WorkflowNode>) {
+  const workflowId = uuidv4();
+  const taskId = uuidv4();
+  // create root task to reuse existing ledger/feedback infra
+  await pool.query(
+    `insert into tasks (id, description, status) values ($1, $2, 'open')`,
+    [taskId, intent || "workflow"]
+  );
+  await pool.query(
+    `insert into workflows (id, task_id, intent, status) values ($1, $2, $3, 'pending')`,
+    [workflowId, taskId, intent || null]
+  );
+  for (const [name, node] of Object.entries(nodes)) {
+    await pool.query(
+      `insert into task_nodes (id, workflow_id, name, capability_id, status, depends_on, payload, max_attempts)
+       values ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [
+        uuidv4(),
+        workflowId,
+        name,
+        node.capabilityId,
+        node.dependsOn.length === 0 ? "ready" : "pending",
+        node.dependsOn,
+        node.payload || {},
+        DAG_MAX_ATTEMPTS,
+      ]
+    );
+  }
+  await orchestrateWorkflow(workflowId);
+  emitEvent("WORKFLOW_PUBLISHED", { workflowId, taskId, intent, nodes: Object.keys(nodes) });
+  return { workflowId, taskId };
+}
+
+async function getReadyNodes(workflowId: string) {
+  const res = await pool.query(
+    `select n.id, n.name, n.capability_id, n.depends_on, n.payload, n.status
+     from task_nodes n
+     where n.workflow_id = $1
+       and (n.status = 'pending' or n.status = 'ready')`,
+    [workflowId]
+  );
+  const rows = res.rows;
+  if (!rows.length) return [];
+  const successRes = await pool.query(
+    `select name from task_nodes where workflow_id = $1 and status = 'success'`,
+    [workflowId]
+  );
+  const successSet = new Set(successRes.rows.map((r: any) => r.name));
+  const ready = rows.filter((row: any) => row.depends_on.every((d: string) => successSet.has(d)));
+  return ready;
+}
+
+async function enqueueNode(node: any, workflowId: string) {
+  // gather parent outputs
+  const parents = node.depends_on || [];
+  let parentOutputs: Record<string, any> = {};
+  if (parents.length) {
+    const res = await pool.query(
+      `select name, result_payload from task_nodes where workflow_id = $1 and name = any($2::text[])`,
+      [workflowId, parents]
+    );
+    parentOutputs = Object.fromEntries(res.rows.map((r: any) => [r.name, r.result_payload || {}]));
+  }
+  const inputs = { ...(node.payload || {}), parents: parentOutputs };
+  const basePayload = {
+    workflowId,
+    nodeId: node.name,
+    capabilityId: node.capability_id,
+    inputs,
+    eventId: uuidv4(),
+    timestamp: new Date().toISOString(),
+  };
+  const taskId = (await pool.query(`select task_id from workflows where id = $1`, [workflowId])).rows[0].task_id;
+
+  // select the top agent for the capability (simple MVP selection)
+  const agentRes = await pool.query(
+    `select a.did, a.endpoint from agents a
+     join capabilities c on c.agent_did = a.did
+     where c.capability_id = $1
+     order by coalesce(a.reputation,0) desc nulls last
+     limit 1`,
+    [node.capability_id]
+  );
+  if (!agentRes.rowCount) {
+    // no agent available; mark failed
+    await pool.query(`update task_nodes set status = 'failed', updated_at = now() where id = $1`, [node.id]);
+    emitEvent("NODE_FAILED", { workflowId, nodeId: node.name, reason: "no agent" });
+    return;
+  }
+  const target = agentRes.rows[0].endpoint;
+  await pool.query(
+    `insert into dispatch_queue (task_id, workflow_id, node_id, event, target_url, payload, attempts, next_attempt, status)
+     values ($1, $2, $3, $4, $5, $6, 0, now(), 'pending')`,
+    [taskId, workflowId, node.name, "node.dispatch", target, basePayload]
+  );
+
+  await pool.query(`update task_nodes set status = 'dispatched', updated_at = now(), started_at = now() where id = $1`, [
+    node.id,
+  ]);
+  emitEvent("NODE_DISPATCHED", { workflowId, nodeId: node.name, capabilityId: node.capability_id });
+}
+
+async function orchestrateWorkflow(workflowId: string) {
+  const readyNodes = await getReadyNodes(workflowId);
+  if (!readyNodes.length) return;
+  // mark as ready
+  const ids = readyNodes.map((r: any) => r.id);
+  await pool.query(`update task_nodes set status = 'ready', updated_at = now() where id = any($1::uuid[])`, [ids]);
+  for (const node of readyNodes) {
+    await enqueueNode(node, workflowId);
   }
 }
 
@@ -421,6 +567,136 @@ app.get("/v1/tasks/:id/feedback", { preHandler: [rateLimitGuard, apiGuard] }, as
     [taskId]
   );
   return reply.send({ taskId, feedback: rows.rows });
+});
+
+// ---- Workflow endpoints ----
+app.post("/v1/workflows/publish", { preHandler: [rateLimitGuard, apiGuard] }, async (request, reply) => {
+  const parsed = workflowPublishSchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.status(400).send({ error: parsed.error.flatten(), message: "Invalid workflow payload" });
+  }
+  const { intent, nodes } = parsed.data;
+  // validate DAG
+  const names = Object.keys(nodes);
+  for (const [name, node] of Object.entries(nodes)) {
+    const deps = node.dependsOn || [];
+    if (deps.includes(name)) {
+      return reply.status(400).send({ error: `Node ${name} depends on itself` });
+    }
+    for (const d of deps) {
+      if (!names.includes(d)) return reply.status(400).send({ error: `Node ${name} depends on missing node ${d}` });
+    }
+  }
+  // cycle check
+  const visiting = new Set<string>();
+  const visited = new Set<string>();
+  const hasCycle = (n: string): boolean => {
+    if (visiting.has(n)) return true;
+    if (visited.has(n)) return false;
+    visiting.add(n);
+    for (const d of nodes[n].dependsOn || []) {
+      if (hasCycle(d)) return true;
+    }
+    visiting.delete(n);
+    visited.add(n);
+    return false;
+  };
+  for (const n of names) {
+    if (hasCycle(n)) return reply.status(400).send({ error: "Cycle detected in DAG" });
+  }
+
+  const wfNodes: Record<string, WorkflowNode> = {};
+  for (const [name, node] of Object.entries(nodes)) {
+    wfNodes[name] = {
+      name,
+      capabilityId: node.capabilityId,
+      dependsOn: node.dependsOn || [],
+      payload: node.payload,
+    };
+  }
+  const { workflowId, taskId } = await createWorkflow(intent, wfNodes);
+  return reply.send({ workflowId, taskId, nodes: Object.keys(nodes) });
+});
+
+app.post("/v1/workflows/nodeResult", { preHandler: [rateLimitGuard, apiGuard] }, async (request, reply) => {
+  const parsed = nodeResultSchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.status(400).send({ error: parsed.error.flatten(), message: "Invalid node result" });
+  }
+  const { workflowId, nodeId, result, error, metrics } = parsed.data;
+  const nodeRes = await pool.query(
+    `select id, capability_id, max_attempts, attempts from task_nodes where workflow_id = $1 and name = $2`,
+    [workflowId, nodeId]
+  );
+  if (!nodeRes.rowCount) return reply.status(404).send({ error: "Node not found" });
+  const node = nodeRes.rows[0];
+
+  let schemaValid = true;
+  let schemaErrors: any = null;
+  let hash = "";
+  try {
+    const payloadToHash = result ?? error ?? {};
+    hash = crypto.createHash("sha256").update(JSON.stringify(payloadToHash)).digest("hex");
+    if (result && REGISTRY_URL) {
+      const validation = await validateOutputSchema(REGISTRY_URL, node.capability_id, result);
+      schemaValid = validation.valid;
+      schemaErrors = validation.errors || null;
+    }
+  } catch {
+    // ignore
+  }
+
+  const newStatus = !schemaValid || error ? "failed" : "success";
+  await pool.query(
+    `update task_nodes set status = $1, attempts = attempts + 1, result_hash = $2, result_payload = $3, finished_at = now(), updated_at = now() where id = $4`,
+    [newStatus, hash || null, result ?? error ?? null, node.id]
+  );
+
+  emitEvent(newStatus === "success" ? "NODE_SUCCESS" : "NODE_FAILED", {
+    workflowId,
+    nodeId,
+    status: newStatus,
+    errors: schemaErrors,
+  });
+
+  // workflow status update
+  const wfStatus = await pool.query(
+    `select
+      sum(case when status = 'failed' then 1 else 0 end) as failed,
+      sum(case when status = 'success' then 1 else 0 end) as success,
+      count(*) as total
+     from task_nodes where workflow_id = $1`,
+    [workflowId]
+  );
+  const { failed, success, total } = wfStatus.rows[0];
+  if (Number(failed) > 0) {
+    await pool.query(`update workflows set status = 'failed', updated_at = now() where id = $1`, [workflowId]);
+  } else if (Number(success) === Number(total)) {
+    await pool.query(`update workflows set status = 'success', updated_at = now() where id = $1`, [workflowId]);
+  } else {
+    await pool.query(`update workflows set status = 'running', updated_at = now() where id = $1`, [workflowId]);
+  }
+
+  if (newStatus === "success") {
+    await orchestrateWorkflow(workflowId);
+  }
+
+  return reply.send({ ok: true, status: newStatus, schemaValid, errors: schemaErrors });
+});
+
+app.get("/v1/workflows/:id", { preHandler: [rateLimitGuard, apiGuard] }, async (request, reply) => {
+  const workflowId = (request.params as any).id;
+  const wf = await pool.query(
+    `select id, task_id, intent, status, created_at, updated_at from workflows where id = $1`,
+    [workflowId]
+  );
+  if (!wf.rowCount) return reply.status(404).send({ error: "Not found" });
+  const nodes = await pool.query(
+    `select name, capability_id, status, depends_on, attempts, max_attempts, result_hash, result_payload, started_at, finished_at, created_at, updated_at
+     from task_nodes where workflow_id = $1 order by created_at asc`,
+    [workflowId]
+  );
+  return reply.send({ workflow: wf.rows[0], nodes: nodes.rows });
 });
 
 app.post("/v1/heartbeat", { preHandler: [rateLimitGuard, apiGuard] }, async (request, reply) => {

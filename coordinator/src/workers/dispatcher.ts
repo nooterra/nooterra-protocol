@@ -17,7 +17,7 @@ function signPayload(body: string) {
 async function processOnce() {
   const now = new Date();
   const { rows } = await pool.query(
-    `select id, task_id, event, target_url, payload, attempts
+    `select id, task_id, workflow_id, node_id, event, target_url, payload, attempts
      from dispatch_queue
      where status = 'pending' and next_attempt <= $1
      order by id asc
@@ -39,6 +39,8 @@ async function processOnce() {
       "Content-Type": "application/json",
       "x-nooterra-event": job.event,
       "x-nooterra-event-id": job.payload?.eventId || "",
+      ...(job.workflow_id ? { "x-nooterra-workflow-id": job.workflow_id } : {}),
+      ...(job.node_id ? { "x-nooterra-node-id": job.node_id } : {}),
     };
     if (signature) headers["x-nooterra-signature"] = signature;
 

@@ -22,6 +22,37 @@ export async function migrate() {
   `);
 
   await pool.query(`
+    create table if not exists workflows (
+      id uuid primary key,
+      task_id uuid references tasks(id) on delete cascade,
+      intent text,
+      status text default 'pending',
+      created_at timestamptz default now(),
+      updated_at timestamptz default now()
+    );
+  `);
+
+  await pool.query(`
+    create table if not exists task_nodes (
+      id uuid primary key,
+      workflow_id uuid references workflows(id) on delete cascade,
+      name text not null,
+      capability_id text not null,
+      status text default 'pending',
+      depends_on text[] default '{}',
+      payload jsonb,
+      result_hash text,
+      result_payload jsonb,
+      attempts int default 0,
+      max_attempts int default 3,
+      started_at timestamptz,
+      finished_at timestamptz,
+      created_at timestamptz default now(),
+      updated_at timestamptz default now()
+    );
+  `);
+
+  await pool.query(`
     create table if not exists bids (
       id serial primary key,
       task_id uuid references tasks(id) on delete cascade,
@@ -107,6 +138,8 @@ export async function migrate() {
     create table if not exists dispatch_queue (
       id serial primary key,
       task_id uuid,
+      workflow_id uuid,
+      node_id text,
       event text not null,
       target_url text not null,
       payload jsonb,
