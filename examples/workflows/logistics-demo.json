@@ -1,0 +1,21 @@
+{
+  "intent": "logistics-demo",
+  "nodes": {
+    "extract_manifest": {
+      "capabilityId": "cap.test.echo",
+      "payload": { "container_id": "CNU1234567" }
+    },
+    "weather_risk": {
+      "capabilityId": "cap.weather.noaa.v1",
+      "dependsOn": ["extract_manifest"]
+    },
+    "customs_classify": {
+      "capabilityId": "cap.customs.classify.v1",
+      "dependsOn": ["extract_manifest"]
+    },
+    "rail_optimize": {
+      "capabilityId": "cap.rail.optimize.v1",
+      "dependsOn": ["weather_risk", "customs_classify"]
+    }
+  }
+}

@@ -1,5 +1,5 @@
 {
-  "name": "nooterra-agent-echo",
+  "name": "nooterra-agent-starter",
   "private": true,
   "type": "module",
   "version": "0.1.0",
@@ -7,7 +7,6 @@
     "start": "node server.mjs"
   },
   "dependencies": {
-    "@nooterra/core": "file:../../packages/nooterra-core",
     "@nooterra/agent-sdk": "file:../../packages/nooterra-agent-sdk"
   }
 }

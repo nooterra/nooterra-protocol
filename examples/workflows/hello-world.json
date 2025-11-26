@@ -1,0 +1,9 @@
+{
+  "intent": "hello-world-demo",
+  "nodes": {
+    "hello": {
+      "capabilityId": "cap.demo.hello.v1",
+      "payload": { "name": "world" }
+    }
+  }
+}

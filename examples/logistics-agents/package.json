@@ -9,6 +9,7 @@
     "start:rail": "node rail-agent/server.mjs"
   },
   "dependencies": {
-    "@nooterra/core": "file:../../packages/nooterra-core"
+    "@nooterra/core": "file:./packages/nooterra-core",
+    "@nooterra/agent-sdk": "file:../../packages/nooterra-agent-sdk"
   }
 }

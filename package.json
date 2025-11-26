@@ -4,10 +4,12 @@
   "version": "0.0.0",
   "workspaces": [
     "packages/nooterra-core",
-    "packages/nooterra-langchain-adapter"
+    "packages/nooterra-langchain-adapter",
+    "packages/nooterra-agent-sdk",
+    "cli/nooterra-agent"
   ],
   "scripts": {
-    "build": "npm run build -w nooterra-core && npm run build -w nooterra-langchain-adapter",
+    "build": "npm run build -w nooterra-core && npm run build -w nooterra-langchain-adapter && npm run build -w @nooterra/agent-sdk && npm run build -w nooterra-agent",
     "publish:core": "npm publish -w nooterra-core --access public",
     "publish:adapter": "npm publish -w nooterra-langchain-adapter --access public"
   }

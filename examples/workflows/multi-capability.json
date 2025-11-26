@@ -1,0 +1,26 @@
+{
+  "intent": "multi-capability-demo",
+  "nodes": {
+    "extract_manifest": {
+      "capabilityId": "cap.test.echo",
+      "payload": { "container_id": "ABC12345" }
+    },
+    "weather_risk": {
+      "capabilityId": "cap.weather.noaa.v1",
+      "dependsOn": ["extract_manifest"]
+    },
+    "customs_classify": {
+      "capabilityId": "cap.customs.classify.v1",
+      "dependsOn": ["extract_manifest"]
+    },
+    "llm_callback": {
+      "capabilityId": "cap.llm.helper.v1",
+      "dependsOn": ["extract_manifest"],
+      "payload": { "instruction": "Summarize manifest for risk" }
+    },
+    "rail_optimize": {
+      "capabilityId": "cap.rail.optimize.v1",
+      "dependsOn": ["weather_risk", "customs_classify", "llm_callback"]
+    }
+  }
+}

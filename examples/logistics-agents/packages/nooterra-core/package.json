@@ -1,0 +1,22 @@
+{
+  "name": "nooterra-core",
+  "version": "0.1.1",
+  "description": "TypeScript SDK for Nooterra registry and coordinator APIs",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "node-fetch": "^3.3.2",
+    "fastify": "^4.28.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.19",
+    "typescript": "^5.4.0"
+  }
+}
