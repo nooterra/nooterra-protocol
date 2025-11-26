@@ -46,10 +46,13 @@ async function processOnce() {
 
     try {
       await pool.query(`update dispatch_queue set status = 'sending' where id = $1`, [job.id]);
+      console.log(`[dispatcher] sending job=${job.id} node=${job.node_id} url=${job.target_url} attempt=${attempt}`);
       const res = await fetch(job.target_url, { method: "POST", headers, body: bodyString });
       if (!res.ok) throw new Error(`status ${res.status}`);
+      console.log(`[dispatcher] success job=${job.id} status=${res.status}`);
       await pool.query(`delete from dispatch_queue where id = $1`, [job.id]);
     } catch (err: any) {
+      console.error(`[dispatcher] error job=${job.id} attempt=${attempt} err=${err?.message || err}`);
       const nextAttempt = attempt + 1;
       if (nextAttempt >= RETRY_BACKOFFS_MS.length) {
         await pool.query(
