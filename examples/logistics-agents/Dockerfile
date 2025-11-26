@@ -1,12 +1,16 @@
 FROM node:20-slim
+
+# Bring the whole repo so file: deps (agent-sdk, core) resolve
 WORKDIR /app
+COPY . .
 
-# When build context is repo root, pull the agent-specific manifest
-COPY examples/logistics-agents/package.json examples/logistics-agents/package-lock.json ./
+# Build shared packages (dist is git-ignored)
+RUN npm --prefix /app/packages/nooterra-core ci && npm --prefix /app/packages/nooterra-core run build && \
+    npm --prefix /app/packages/nooterra-agent-sdk ci && npm --prefix /app/packages/nooterra-agent-sdk run build
+
+# Install only the logistics agents' dependencies
+WORKDIR /app/examples/logistics-agents
 RUN npm ci
-
-# Copy agent source
-COPY examples/logistics-agents/. .
 
 # Use AGENT_START_CMD to select which agent to run (start:weather/start:customs/start:rail)
 CMD ["sh", "-c", "npm run ${AGENT_START_CMD:-start:weather}"]

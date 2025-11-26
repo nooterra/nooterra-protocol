@@ -1,11 +1,15 @@
 FROM node:20-slim
+
+# Bring full repo so local file: deps resolve
 WORKDIR /app
+COPY . .
 
-# Build context is repo root; pull echo manifest from subdir
-COPY examples/agent-echo/package.json examples/agent-echo/package-lock.json ./
+# Build shared packages (dist is git-ignored)
+RUN npm --prefix /app/packages/nooterra-core ci && npm --prefix /app/packages/nooterra-core run build && \
+    npm --prefix /app/packages/nooterra-agent-sdk ci && npm --prefix /app/packages/nooterra-agent-sdk run build
+
+# Install only echo agent deps
+WORKDIR /app/examples/agent-echo
 RUN npm ci
-
-# Copy echo source
-COPY examples/agent-echo/. .
 
 CMD ["npm", "run", "start"]
