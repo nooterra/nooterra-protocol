@@ -9,8 +9,9 @@ RUN git clone https://github.com/nooterra/nooterra-protocol.git repo
 WORKDIR /app
 COPY . .
 
-# Copy shared packages from cloned repo so file: deps resolve
-RUN mkdir -p /app/packages && cp -r /tmp/repo/packages /app/
+# Copy shared packages + root tsconfig from cloned repo so file: deps resolve
+RUN mkdir -p /app/packages && cp -r /tmp/repo/packages /app/ && \
+    cp /tmp/repo/tsconfig.json /app/tsconfig.json
 
 # Build shared packages (dist is git-ignored). Allow missing peer deps to keep ci happy in container.
 ENV npm_config_legacy_peer_deps=true
