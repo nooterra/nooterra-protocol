@@ -188,6 +188,13 @@ const heartbeatSchema = z.object({
   queue_depth: z.number().int().nonnegative().default(0),
 });
 
+const discoverQuerySchema = z.object({
+  capabilityId: z.string().optional(),
+  q: z.string().optional(),
+  minReputation: z.coerce.number().min(0).max(1).optional(),
+  limit: z.coerce.number().int().positive().max(50).optional(),
+});
+
 const resultSchema = z.object({
   result: z.any().optional(),
   error: z.string().optional(),
@@ -524,6 +531,76 @@ app.get("/v1/tasks", { preHandler: [rateLimitGuard, apiGuard] }, async (request,
     [limit]
   );
   return reply.send({ tasks: rows.rows });
+});
+
+// Agent discovery (SDN v1 lightweight)
+app.get("/v1/discover", { preHandler: [rateLimitGuard] }, async (request, reply) => {
+  const parsed = discoverQuerySchema.safeParse(request.query);
+  if (!parsed.success) {
+    return reply.status(400).send({ error: parsed.error.flatten(), message: "Invalid query" });
+  }
+  const { capabilityId, q, minReputation, limit } = parsed.data;
+  const lim = limit ?? 10;
+  const minRep = minReputation ?? 0;
+
+  const where: string[] = [];
+  const params: any[] = [];
+  let idx = 1;
+  if (capabilityId) {
+    where.push(`c.capability_id = $${idx++}`);
+    params.push(capabilityId);
+  }
+  if (q) {
+    where.push(`(c.capability_id ilike $${idx} or c.description ilike $${idx})`);
+    params.push(`%${q}%`);
+    idx++;
+  }
+  where.push(`coalesce(ar.reputation, a.reputation, 0) >= $${idx++}`);
+  params.push(minRep);
+  const whereSql = where.length ? `where ${where.join(" and ")}` : "";
+
+  const sql = `
+    select
+      a.did,
+      a.endpoint,
+      c.capability_id,
+      c.description,
+      coalesce(ar.reputation, a.reputation, 0) as reputation,
+      coalesce(hb.availability_score, 0) as availability,
+      hb.last_seen,
+      hb.latency_ms,
+      hb.queue_depth
+    from capabilities c
+    join agents a on a.did = c.agent_did
+    left join agent_reputation ar on ar.agent_did = a.did
+    left join heartbeats hb on hb.agent_did = a.did
+    ${whereSql}
+    order by
+      coalesce(ar.reputation, a.reputation, 0) desc nulls last,
+      coalesce(hb.availability_score, 0) desc nulls last,
+      hb.latency_ms asc nulls last
+    limit $${idx}
+  `;
+  params.push(lim);
+
+  const res = await pool.query(sql, params);
+  const results = res.rows.map((row: any) => {
+    const stale = row.last_seen ? Date.now() - new Date(row.last_seen).getTime() > HEARTBEAT_TTL_MS * 2 : false;
+    return {
+      did: row.did,
+      endpoint: row.endpoint,
+      capabilityId: row.capability_id,
+      description: row.description,
+      reputation: Number(row.reputation || 0),
+      availability: stale ? 0 : Number(row.availability || 0),
+      latency_ms: row.latency_ms ?? null,
+      queue_depth: row.queue_depth ?? null,
+      last_seen: row.last_seen,
+      stale,
+    };
+  });
+
+  return reply.send({ results, count: results.length });
 });
 
 app.post("/v1/tasks/:id/settle", { preHandler: [rateLimitGuard, apiGuard] }, async (request, reply) => {
