@@ -134,6 +134,9 @@ const rateLimitGuard = async (request: Req, reply: Rep) => {
 };
 
 const apiGuard = async (request: Req, reply: Rep) => {
+  // Allow heartbeat and nodeResult without API key so agents can report liveness/results
+  const path = request.url || "";
+  if (path.startsWith("/v1/heartbeat") || path.startsWith("/v1/workflows/nodeResult")) return;
   if (!API_KEY || API_KEY.toLowerCase() === "none") return;
   const method = request.method?.toUpperCase() || "";
   const isWrite = ["POST", "PUT", "PATCH", "DELETE"].includes(method);
