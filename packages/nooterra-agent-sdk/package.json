@@ -5,6 +5,9 @@
   "type": "module",
   "main": "dist/index.js",
   "exports": "./dist/index.js",
+  "files": [
+    "dist"
+  ],
   "bin": {
     "nooterra-agent-runtime": "dist/bin/runtime-cli.js"
   },
