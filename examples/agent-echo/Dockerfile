@@ -7,10 +7,9 @@ RUN git clone https://github.com/nooterra/nooterra-protocol.git repo
 
 # Move agent source (from build context) into /app
 WORKDIR /app
-COPY . .
-
-# Copy shared packages + root tsconfig from cloned repo so file: deps resolve
-RUN mkdir -p /app/packages && cp -r /tmp/repo/packages /app/ && \
+# Prefer the cloned repo content to guarantee lockfiles and dist availability
+RUN mkdir -p /app/examples && cp -r /tmp/repo/examples/agent-echo /app/examples/agent-echo && \
+    mkdir -p /app/packages && cp -r /tmp/repo/packages /app/ && \
     cp /tmp/repo/tsconfig.json /app/tsconfig.json
 
 # Build shared packages (dist is git-ignored). Allow missing peer deps to keep ci happy in container.
