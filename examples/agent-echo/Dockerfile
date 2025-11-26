@@ -14,8 +14,10 @@ RUN mkdir -p /app/packages && cp -r /tmp/repo/packages /app/
 
 # Build shared packages (dist is git-ignored). Allow missing peer deps to keep ci happy in container.
 ENV npm_config_legacy_peer_deps=true
-RUN npm --prefix /app/packages/nooterra-core ci && npm --prefix /app/packages/nooterra-core run build && \
-    npm --prefix /app/packages/nooterra-agent-sdk ci && npm --prefix /app/packages/nooterra-agent-sdk run build
+WORKDIR /app/packages/nooterra-core
+RUN npm ci && npm run build
+WORKDIR /app/packages/nooterra-agent-sdk
+RUN npm ci && npm run build
 
 # Install only echo agent deps
 WORKDIR /app/examples/agent-echo
