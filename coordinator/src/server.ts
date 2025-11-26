@@ -900,7 +900,8 @@ app.get("/v1/workflows", { preHandler: [rateLimitGuard, apiGuard] }, async (requ
   return reply.send({ workflows });
 });
 
-app.post("/v1/heartbeat", { preHandler: [rateLimitGuard, apiGuard] }, async (request, reply) => {
+// Heartbeat open to all agents (no API key required) to avoid liveness failures
+app.post("/v1/heartbeat", { preHandler: [rateLimitGuard] }, async (request, reply) => {
   const parsed = heartbeatSchema.safeParse(request.body);
   if (!parsed.success) {
     return reply.status(400).send({ error: parsed.error.flatten(), message: "Invalid payload" });
