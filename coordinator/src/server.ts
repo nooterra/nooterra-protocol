@@ -506,6 +506,25 @@ async function enqueueNode(node: any, workflowId: string) {
   };
   const taskId = (await pool.query(`select task_id from workflows where id = $1`, [workflowId])).rows[0].task_id;
 
+  // Budget pre-check: if adding this node's price would exceed max_cents, fail it immediately
+  const wfBudget = await pool.query(
+    `select max_cents, spent_cents from workflows where id = $1`,
+    [workflowId]
+  );
+  const wfRow = wfBudget.rowCount ? wfBudget.rows[0] : null;
+  if (wfRow && wfRow.max_cents != null) {
+    const priceRes = await pool.query(
+      `select price_cents from capabilities where capability_id = $1 limit 1`,
+      [node.capability_id]
+    );
+    const price = priceRes.rowCount ? Number(priceRes.rows[0].price_cents || 0) : 0;
+    if (price > 0 && Number(wfRow.spent_cents || 0) + price > Number(wfRow.max_cents)) {
+      await pool.query(`update task_nodes set status = 'failed', updated_at = now() where id = $1`, [node.id]);
+      emitEvent("NODE_FAILED", { workflowId, nodeId: node.name, reason: "budget_exceeded" });
+      return;
+    }
+  }
+
   // select the top agent for the capability (simple MVP selection)
   const agentRes = await pool.query(
     `select a.did, a.endpoint,
@@ -550,10 +569,12 @@ async function enqueueNode(node: any, workflowId: string) {
   }
   const target = agentRes.rows[0].endpoint;
   const agentDid = agentRes.rows[0].did;
+  const dispatchKey = `${workflowId}:${node.name}:${node.attempts || 0}`;
   await pool.query(
-    `insert into dispatch_queue (task_id, workflow_id, node_id, event, target_url, payload, attempts, next_attempt, status)
-     values ($1, $2, $3, $4, $5, $6, 0, now(), 'pending')`,
-    [taskId, workflowId, node.name, "node.dispatch", target, basePayload]
+    `insert into dispatch_queue (task_id, workflow_id, node_id, event, target_url, payload, attempts, next_attempt, status, dispatch_key)
+     values ($1, $2, $3, $4, $5, $6, 0, now(), 'pending', $7)
+     on conflict (dispatch_key) do nothing`,
+    [taskId, workflowId, node.name, "node.dispatch", target, basePayload, dispatchKey]
   );
 
   await pool.query(
