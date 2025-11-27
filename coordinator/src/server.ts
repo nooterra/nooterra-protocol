@@ -550,12 +550,10 @@ async function enqueueNode(node: any, workflowId: string) {
   }
   const target = agentRes.rows[0].endpoint;
   const agentDid = agentRes.rows[0].did;
-  const dispatchKey = `${workflowId}:${node.name}:${(node as any).attempts ?? 0}`;
   await pool.query(
-    `insert into dispatch_queue (task_id, workflow_id, node_id, dispatch_key, event, target_url, payload, attempts, next_attempt, status)
-     values ($1, $2, $3, $4, $5, $6, $7, 0, now(), 'pending')
-     on conflict (dispatch_key) do nothing`,
-    [taskId, workflowId, node.name, dispatchKey, "node.dispatch", target, basePayload]
+    `insert into dispatch_queue (task_id, workflow_id, node_id, event, target_url, payload, attempts, next_attempt, status)
+     values ($1, $2, $3, $4, $5, $6, 0, now(), 'pending')`,
+    [taskId, workflowId, node.name, "node.dispatch", target, basePayload]
   );
 
   await pool.query(
