@@ -27,10 +27,16 @@ export async function migrate() {
       task_id uuid references tasks(id) on delete cascade,
       intent text,
       status text default 'pending',
+      payer_did text default 'did:noot:system',
+      max_cents bigint,
+      spent_cents bigint default 0,
       created_at timestamptz default now(),
       updated_at timestamptz default now()
     );
   `);
+  await pool.query(`alter table workflows add column if not exists payer_did text default 'did:noot:system';`);
+  await pool.query(`alter table workflows add column if not exists max_cents bigint;`);
+  await pool.query(`alter table workflows add column if not exists spent_cents bigint default 0;`);
 
   await pool.query(`
     create table if not exists task_nodes (
@@ -44,6 +50,7 @@ export async function migrate() {
       payload jsonb,
       result_hash text,
       result_payload jsonb,
+      result_id uuid,
       attempts int default 0,
       max_attempts int default 3,
       started_at timestamptz,
@@ -55,6 +62,7 @@ export async function migrate() {
       updated_at timestamptz default now()
     );
   `);
+  await pool.query(`create unique index if not exists ix_task_nodes_result_id on task_nodes(result_id) where result_id is not null;`);
 
   await pool.query(`
     create table if not exists bids (
@@ -67,20 +75,25 @@ export async function migrate() {
     );
   `);
 
+  // Simple ledger: accounts + events
   await pool.query(`
-    create table if not exists balances (
-      agent_did text primary key,
-      credits numeric default 0,
-      updated_at timestamptz default now()
+    create table if not exists ledger_accounts (
+      id serial primary key,
+      owner_did text not null unique,
+      balance numeric not null default 0,
+      currency text default 'NCR',
+      created_at timestamptz default now()
     );
   `);
 
   await pool.query(`
-    create table if not exists ledger (
+    create table if not exists ledger_events (
       id serial primary key,
-      agent_did text not null,
-      task_id uuid,
+      account_id int references ledger_accounts(id) on delete cascade,
+      workflow_id uuid,
+      node_name text,
       delta numeric not null,
+      reason text,
       meta jsonb,
       created_at timestamptz default now()
     );
@@ -138,6 +151,7 @@ export async function migrate() {
       updated_at timestamptz default now()
     );
   `);
+  await pool.query(`create index if not exists heartbeats_agent_idx on heartbeats(agent_did);`);
 
   await pool.query(`
     create table if not exists dlq (
@@ -158,6 +172,7 @@ export async function migrate() {
       task_id uuid,
       workflow_id uuid,
       node_id text,
+      dispatch_key text,
       event text not null,
       target_url text not null,
       payload jsonb,
@@ -169,6 +184,9 @@ export async function migrate() {
   `);
 
   await pool.query(`alter table dispatch_queue add column if not exists last_error text;`);
+  await pool.query(
+    `create unique index if not exists ix_dispatch_queue_dispatch_key on dispatch_queue(dispatch_key) where dispatch_key is not null;`
+  );
 
   await pool.query(`
     create table if not exists task_results (
@@ -199,6 +217,21 @@ export async function migrate() {
       last_updated_at timestamptz not null default now()
     );
   `);
+
+  // optional price for capabilities (populated by registry; safe to add here)
+  await pool.query(`alter table if exists capabilities add column if not exists price_cents int default 0;`);
+
+  await pool.query(`
+    create table if not exists agent_endorsements (
+      id serial primary key,
+      from_did text not null,
+      to_did text not null,
+      weight numeric default 1,
+      created_at timestamptz default now()
+    );
+  `);
+  await pool.query(`create index if not exists agent_endorsements_from_idx on agent_endorsements(from_did);`);
+  await pool.query(`create index if not exists agent_endorsements_to_idx on agent_endorsements(to_did);`);
 
   // agents table lives in the same DB (populated by registry); add reputation column if missing
   await pool.query(`alter table if exists agents add column if not exists reputation double precision default 0;`);

@@ -31,7 +31,20 @@ async function postNodeResult(config: AgentConfig, payload: any, result: Handler
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
-  });
+  })
+    .then(async (res) => {
+      if (!res.ok) {
+        const text = await res.text().catch(() => "<no-body>");
+        console.error(
+          `[agent-sdk] nodeResult post failed status=${res.status} url=${config.coordinatorUrl} workflow=${payload.workflowId} node=${payload.nodeId} body=${text}`
+        );
+      }
+    })
+    .catch((err) => {
+      console.error(
+        `[agent-sdk] nodeResult post error workflow=${payload.workflowId} node=${payload.nodeId} err=${err?.message || err}`
+      );
+    });
 }
 
 async function startHeartbeat(config: AgentConfig, fastifyPort: number) {

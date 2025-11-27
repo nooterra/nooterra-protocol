@@ -1,16 +1,11 @@
 FROM node:20-slim
 
-# Clone full repo to fetch shared packages (agent-sdk/core) even if build context is just the agent folder
-WORKDIR /tmp
-RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
-RUN git clone https://github.com/nooterra/nooterra-protocol.git repo
-
-# Move agent source (from build context) into /app
+# Work in /app and copy only what we need from the build context
 WORKDIR /app
-# Prefer the cloned repo content to guarantee lockfiles and dist availability
-RUN mkdir -p /app/examples && cp -r /tmp/repo/examples/agent-echo /app/examples/agent-echo && \
-    mkdir -p /app/packages && cp -r /tmp/repo/packages /app/ && \
-    cp /tmp/repo/tsconfig.json /app/tsconfig.json
+
+# Bring shared packages + root tsconfig for local file: deps
+COPY packages ./packages
+COPY tsconfig.json ./tsconfig.json
 
 # Build shared packages (dist is git-ignored). Allow missing peer deps to keep ci happy in container.
 ENV npm_config_legacy_peer_deps=true
@@ -19,8 +14,10 @@ RUN npm ci && npm run build
 WORKDIR /app/packages/nooterra-agent-sdk
 RUN npm ci && npm run build
 
-# Install only echo agent deps
+# Install only echo agent deps with the current build-context code
 WORKDIR /app/examples/agent-echo
+COPY examples/agent-echo/package*.json ./
 RUN npm ci
+COPY examples/agent-echo ./
 
 CMD ["npm", "run", "start"]

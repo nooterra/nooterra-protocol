@@ -20,6 +20,20 @@ const agentConfig = defineAgent({
         return { result: { echo: inputs }, metrics: { latency_ms: 200 } };
       },
     },
+    {
+      id: "cap.verify.generic.v1",
+      description: "Generic verification stub (approves everything)",
+      handler: async ({ inputs }) => {
+        // For now simply mark as verified; attach original payload if present.
+        return {
+          result: {
+            verified: true,
+            original: inputs,
+          },
+          metrics: { latency_ms: 100 },
+        };
+      },
+    },
   ],
 });
 
