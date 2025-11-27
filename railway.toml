@@ -1,0 +1,4 @@
+[build]
+builder = "dockerfile"
+dockerfile = "coordinator/Dockerfile"
+root = "."
