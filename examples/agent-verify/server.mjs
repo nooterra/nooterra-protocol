@@ -4,10 +4,9 @@ const webhookSecret = process.env.WEBHOOK_SECRET || "";
 const agentDid = process.env.DID || "did:noot:verify";
 const port = Number(process.env.PORT || 4200);
 
-const coordUrl =
-  process.env.COORD_URL ||
-  process.env.INTERNAL_COORD_URL ||
-  (process.env.RAILWAY_ENVIRONMENT ? "http://nooterra-coordinator.railway.internal:3002" : "https://coord.nooterra.ai");
+const coordUrl = process.env.RAILWAY_ENVIRONMENT
+  ? process.env.INTERNAL_COORD_URL || "http://nooterra-coordinator.railway.internal:3002"
+  : process.env.COORD_URL || "https://coord.nooterra.ai";
 
 const agentConfig = defineAgent({
   did: agentDid,
