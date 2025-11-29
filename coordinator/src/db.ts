@@ -53,6 +53,7 @@ export async function migrate() {
       result_id uuid,
       attempts int default 0,
       max_attempts int default 3,
+      deadline_at timestamptz,
       started_at timestamptz,
       finished_at timestamptz,
       requires_verification boolean default false,
@@ -63,6 +64,7 @@ export async function migrate() {
     );
   `);
   await pool.query(`create unique index if not exists ix_task_nodes_result_id on task_nodes(result_id) where result_id is not null;`);
+  await pool.query(`alter table task_nodes add column if not exists deadline_at timestamptz;`);
 
   await pool.query(`
     create table if not exists bids (

@@ -8,6 +8,7 @@ dotenv.config();
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "";
 const BATCH_MS = Number(process.env.DISPATCH_BATCH_MS || 1000);
 const RETRY_BACKOFFS_MS = [0, 1000, 5000, 30000];
+const NODE_TIMEOUT_MS = Number(process.env.NODE_TIMEOUT_MS || 60000);
 
 function signPayload(body: string) {
   if (!WEBHOOK_SECRET) return null;
@@ -18,6 +19,24 @@ const PROTOCOL_FEE_BPS = Number(process.env.PROTOCOL_FEE_BPS || 30);
 const SYSTEM_PAYER = process.env.SYSTEM_PAYER || "did:noot:system";
 
 async function processOnce() {
+  // Timeout stale dispatched nodes
+  await pool.query(
+    `update task_nodes
+        set status = 'failed_timeout', updated_at = now()
+      where status = 'dispatched'
+        and deadline_at is not null
+        and deadline_at < now()
+        and finished_at is null`
+  );
+  // Remove any pending dispatches for timed-out nodes
+  await pool.query(
+    `delete from dispatch_queue dq
+      using task_nodes tn
+      where tn.workflow_id = dq.workflow_id
+        and tn.name = dq.node_id
+        and tn.status = 'failed_timeout'`
+  );
+
   const now = new Date();
   const { rows } = await pool.query(
     `select id, task_id, workflow_id, node_id, event, target_url, payload, attempts
