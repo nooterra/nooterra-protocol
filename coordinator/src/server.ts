@@ -34,6 +34,26 @@ const PAGERANK_TOL = Number(process.env.REP_TOL || 1e-4);
 const REP_INTERVAL_MS = Number(process.env.REP_INTERVAL_MS || 0);
 const PROTOCOL_FEE_BPS = Number(process.env.PROTOCOL_FEE_BPS || 30); // 0.3% default
 const SYSTEM_PAYER = process.env.SYSTEM_PAYER || "did:noot:system";
+const VERIFY_MAP: Record<string, string> = {
+  "cap.customs.classify.v1": "cap.verify.generic.v1",
+  "cap.weather.noaa.v1": "cap.verify.generic.v1",
+  "cap.rail.optimize.v1": "cap.verify.generic.v1",
+};
+
+function verifySignature(pubDerBase64: string | null, payload: any, signatureB64: string) {
+  if (!pubDerBase64) return false;
+  try {
+    const payloadStr = typeof payload === "string" ? payload : JSON.stringify(payload);
+    return crypto.verify(
+      null,
+      Buffer.from(payloadStr),
+      crypto.createPublicKey({ key: Buffer.from(pubDerBase64, "base64"), format: "der", type: "spki" }),
+      Buffer.from(signatureB64, "base64")
+    );
+  } catch {
+    return false;
+  }
+}
 
 async function computeLatencyMs(started: any, metrics?: any) {
   if (metrics?.latency_ms != null) return Number(metrics.latency_ms);
@@ -224,9 +244,11 @@ const feedbackSchema = z.object({
 });
 
 const endorseSchema = z.object({
-  fromDid: z.string().optional(),
+  fromDid: z.string(),
   toDid: z.string(),
   weight: z.number().min(0).max(5).optional(),
+  timestamp: z.string().optional(),
+  signature: z.string(),
 });
 
 // Simple PageRank over endorsements + feedback graph
@@ -914,22 +936,18 @@ app.post("/v1/workflows/nodeResult", { preHandler: [rateLimitGuard, apiGuard] },
       throw new Error("duplicate_result");
     }
 
-    // Optional signature verification
-    if (signature && node.agent_did) {
+    // Signature verification (required when agent has public_key)
+    if (node.agent_did) {
       const keyRes = await client.query(`select public_key from agents where did = $1`, [node.agent_did]);
       const pub = keyRes.rowCount ? keyRes.rows[0].public_key : null;
       if (pub) {
-        try {
-          const payloadToSign = JSON.stringify({ workflowId, nodeId, result, error, metrics, resultId: incomingResultId });
-          const ok = crypto.verify(
-            null,
-            Buffer.from(payloadToSign),
-            crypto.createPublicKey({ key: Buffer.from(pub, "base64"), format: "der", type: "spki" }),
-            Buffer.from(signature, "base64")
-          );
-          if (!ok) throw new Error("invalid_signature");
-        } catch {
-          app.log.warn({ nodeId, agent: node.agent_did }, "signature verification failed (non-fatal)");
+        if (!signature) {
+          throw new Error("missing_signature");
+        }
+        const payloadToSign = { workflowId, nodeId, result, error, metrics, resultId: incomingResultId };
+        const ok = verifySignature(pub, payloadToSign, signature);
+        if (!ok) {
+          throw new Error("invalid_signature");
         }
       }
     }
@@ -1031,6 +1049,8 @@ app.post("/v1/workflows/nodeResult", { preHandler: [rateLimitGuard, apiGuard] },
     client.release();
     if (err?.message === "node_not_found") return reply.status(404).send({ error: "Node not found" });
     if (err?.message === "duplicate_result") return reply.status(409).send({ error: "duplicate_result" });
+    if (err?.message === "missing_signature") return reply.status(400).send({ error: "missing_signature" });
+    if (err?.message === "invalid_signature") return reply.status(400).send({ error: "invalid_signature" });
     if (err?.message === "budget_exceeded") {
       await pool.query(`update workflows set status='failed', updated_at=now() where id = $1`, [workflowId]);
       await pool.query(`update task_nodes set status='failed' where workflow_id=$1 and name=$2`, [workflowId, nodeId]);
@@ -1084,7 +1104,7 @@ app.post("/v1/workflows/nodeResult", { preHandler: [rateLimitGuard, apiGuard] },
   await updateAgentStatsAndRep(agentDid, newStatus === "success", latencyMs);
 
   if (newStatus === "success" && node?.requires_verification) {
-    const capVerify = "cap.verify.generic.v1";
+    const capVerify = VERIFY_MAP[node.capability_id] || "cap.verify.generic.v1";
     const verifyAvail = await pool.query(
       `select 1 from capabilities where capability_id = $1 limit 1`,
       [capVerify]
@@ -1105,6 +1125,8 @@ app.post("/v1/workflows/nodeResult", { preHandler: [rateLimitGuard, apiGuard] },
           DAG_MAX_ATTEMPTS,
         ]
       );
+    } else {
+      app.log.warn({ workflowId, nodeId, cap: node.capability_id }, "requires_verification but no verifier registered");
     }
   }
 
@@ -1147,7 +1169,15 @@ app.post("/v1/feedback", { preHandler: [rateLimitGuard, apiGuard] }, async (requ
 app.post("/v1/endorse", { preHandler: [rateLimitGuard, apiGuard] }, async (request, reply) => {
   const parsed = endorseSchema.safeParse(request.body);
   if (!parsed.success) return reply.status(400).send({ error: parsed.error.flatten() });
-  const { fromDid, toDid, weight } = parsed.data;
+  const { fromDid, toDid, weight, timestamp, signature } = parsed.data;
+  // verify signature if we have a public key
+  const keyRes = await pool.query(`select public_key from agents where did = $1`, [fromDid]);
+  const pub = keyRes.rowCount ? keyRes.rows[0].public_key : null;
+  if (pub) {
+    const payloadToSign = { fromDid, toDid, weight: weight ?? 1, timestamp: timestamp || "" };
+    const ok = verifySignature(pub, payloadToSign, signature);
+    if (!ok) return reply.status(400).send({ error: "invalid_signature" });
+  }
   await pool.query(
     `insert into agent_endorsements (from_did, to_did, weight) values ($1,$2,$3)`,
     [fromDid || "system", toDid, weight ?? 1]
