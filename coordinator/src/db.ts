@@ -186,8 +186,15 @@ export async function migrate() {
   `);
 
   await pool.query(`alter table dispatch_queue add column if not exists last_error text;`);
+  // ensure unique constraint for ON CONFLICT (dispatch_key)
+  await pool.query(`do $$
+  begin
+    if exists(select 1 from pg_indexes where schemaname='public' and indexname='ix_dispatch_queue_dispatch_key') then
+      execute 'drop index if exists ix_dispatch_queue_dispatch_key';
+    end if;
+  end$$;`);
   await pool.query(
-    `create unique index if not exists ix_dispatch_queue_dispatch_key on dispatch_queue(dispatch_key) where dispatch_key is not null;`
+    `create unique index if not exists ix_dispatch_queue_dispatch_key on dispatch_queue(dispatch_key);`
   );
 
   await pool.query(`
