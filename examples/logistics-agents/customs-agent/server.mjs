@@ -14,6 +14,32 @@ const agentConfig = defineAgent({
   coordinatorUrl: coordUrl,
   endpoint: process.env.AGENT_ENDPOINT || "https://agent-customs-production.up.railway.app",
   webhookSecret,
+  publicKey: process.env.PUBLIC_KEY || "",
+  privateKey: process.env.PRIVATE_KEY || "",
+  hooks: {
+    onDispatch: (e) => {
+      console.log("[customs-agent] dispatch", {
+        workflowId: e.workflowId,
+        nodeId: e.nodeId,
+        capabilityId: e.capabilityId,
+      });
+    },
+    onResult: (e) => {
+      console.log("[customs-agent] result", {
+        workflowId: e.workflowId,
+        nodeId: e.nodeId,
+        capabilityId: e.capabilityId,
+      });
+    },
+    onError: (e) => {
+      console.error("[customs-agent] error", {
+        workflowId: e.workflowId,
+        nodeId: e.nodeId,
+        capabilityId: e.capabilityId,
+        message: e.error?.message || String(e.error),
+      });
+    },
+  },
   port,
   capabilities: [
     {

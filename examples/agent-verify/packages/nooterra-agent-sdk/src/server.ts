@@ -1,8 +1,6 @@
 import Fastify from "fastify";
 import fetch from "node-fetch";
-import { randomUUID } from "crypto";
 import { verifySignature } from "./hmac.js";
-import { loadKeypairFromConfig, signPayload } from "./crypto.js";
 import type { AgentConfig, HandlerContext, HandlerResult } from "./types.js";
 
 function buildHandlerContext(payload: any): HandlerContext {
@@ -18,8 +16,7 @@ function buildHandlerContext(payload: any): HandlerContext {
 }
 
 async function postNodeResult(config: AgentConfig, payload: any, result: HandlerResult) {
-  const resultId = payload.resultId || randomUUID();
-  const baseBody = {
+  const body = {
     workflowId: payload.workflowId,
     taskId: payload.taskId ?? payload.workflowId,
     nodeId: payload.nodeId,
@@ -28,20 +25,7 @@ async function postNodeResult(config: AgentConfig, payload: any, result: Handler
     status: "success",
     result: result.result,
     metrics: result.metrics,
-    resultId,
   };
-
-  const keypair = loadKeypairFromConfig(config);
-  const payloadToSign = {
-    workflowId: baseBody.workflowId,
-    nodeId: baseBody.nodeId,
-    result: baseBody.result,
-    error: undefined,
-    metrics: baseBody.metrics,
-    resultId,
-  };
-  const signature = signPayload(Buffer.from(JSON.stringify(payloadToSign)), keypair.privateKey);
-  const body = { ...baseBody, signature, publicKey: keypair.publicKey };
 
   await fetch(`${config.coordinatorUrl}/v1/workflows/nodeResult`, {
     method: "POST",

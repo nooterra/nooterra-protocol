@@ -2,10 +2,9 @@ import { AgentConfig, WorkflowDef } from "./types.js";
 import { startAgentServer } from "./server.js";
 import { registerAgent } from "./register.js";
 import { publishWorkflow } from "./workflow.js";
-import { generateKeypair } from "./crypto.js";
 
 export * from "./types.js";
-export { startAgentServer, registerAgent, publishWorkflow, generateKeypair };
+export { startAgentServer, registerAgent, publishWorkflow };
 
 export function defineAgent(config: AgentConfig): AgentConfig {
   // Basic shape guard; deeper validation can be added later

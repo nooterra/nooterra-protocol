@@ -1,0 +1,13 @@
+{
+  "name": "nooterra-agent-langgraph-demo",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "dependencies": {
+    "@nooterra/agent-sdk": "file:../../packages/nooterra-agent-sdk"
+  }
+}
+

@@ -1,0 +1,12 @@
+{
+  "name": "nooterra-agent-verify",
+  "private": true,
+  "type": "module",
+  "version": "0.1.0",
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "dependencies": {
+    "@nooterra/agent-sdk": "file:./packages/nooterra-agent-sdk"
+  }
+}

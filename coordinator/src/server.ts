@@ -7,6 +7,7 @@ import pino from "pino";
 import { pool, migrate } from "./db.js";
 import fetch from "node-fetch";
 import crypto from "crypto";
+import nacl from "tweetnacl";
 import { validateOutputSchema } from "./validation.js";
 import { listWorkflows } from "./list-workflows.js";
 import { startDispatcherLoop } from "./workers/dispatcher.js";
@@ -24,6 +25,7 @@ const HEARTBEAT_TTL_MS = Number(process.env.HEARTBEAT_TTL_MS || 60_000);
 const DISPATCH_BATCH_MS = Number(process.env.DISPATCH_BATCH_MS || 1000);
 const RETRY_BACKOFFS_MS = [0, 1000, 5000, 30000];
 const DAG_MAX_ATTEMPTS = Number(process.env.DAG_MAX_ATTEMPTS || 3);
+const NODE_TIMEOUT_MS = Number(process.env.NODE_TIMEOUT_MS || 60000);
 const CRITICAL_CAPS = new Set<string>(["cap.customs.classify.v1"]);
 const MIN_REP_CRITICAL = Number(process.env.MIN_REP_CRITICAL || 0.0);
 const FEEDBACK_WEIGHT = 0.2;
@@ -40,16 +42,14 @@ const VERIFY_MAP: Record<string, string> = {
   "cap.rail.optimize.v1": "cap.verify.generic.v1",
 };
 
-function verifySignature(pubDerBase64: string | null, payload: any, signatureB64: string) {
-  if (!pubDerBase64) return false;
+function verifySignature(pubKeyBase64: string | null, payload: any, signatureB64: string) {
+  if (!pubKeyBase64) return false;
   try {
-    const payloadStr = typeof payload === "string" ? payload : JSON.stringify(payload);
-    return crypto.verify(
-      null,
-      Buffer.from(payloadStr),
-      crypto.createPublicKey({ key: Buffer.from(pubDerBase64, "base64"), format: "der", type: "spki" }),
-      Buffer.from(signatureB64, "base64")
-    );
+    const msg = typeof payload === "string" ? payload : JSON.stringify(payload);
+    const msgBytes = new TextEncoder().encode(msg);
+    const pubBytes = Uint8Array.from(Buffer.from(pubKeyBase64, "base64"));
+    const sigBytes = Uint8Array.from(Buffer.from(signatureB64, "base64"));
+    return nacl.sign.detached.verify(msgBytes, sigBytes, pubBytes);
   } catch {
     return false;
   }
@@ -351,6 +351,7 @@ const nodeResultSchema = z.object({
   workflowId: z.string(),
   nodeId: z.string(),
   resultId: z.string().uuid().optional(),
+  publicKey: z.string().optional(),
   signature: z.string().optional(),
   result: z.any().optional(),
   error: z.string().optional(),
@@ -465,22 +466,23 @@ async function createWorkflow(
     [workflowId, taskId, intent || null, payerDid || SYSTEM_PAYER, maxCents ?? null]
   );
   for (const [name, node] of Object.entries(nodes)) {
-    await pool.query(
-      `insert into task_nodes (id, workflow_id, name, capability_id, status, depends_on, payload, max_attempts, requires_verification)
-       values ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-      [
-        uuidv4(),
-        workflowId,
-        name,
-        node.capabilityId,
-        node.dependsOn.length === 0 ? "ready" : "pending",
-        node.dependsOn,
-        node.payload || {},
-        DAG_MAX_ATTEMPTS,
-        CRITICAL_CAPS.has(node.capabilityId),
-      ]
-    );
-  }
+  await pool.query(
+    `insert into task_nodes (id, workflow_id, name, capability_id, status, depends_on, payload, max_attempts, requires_verification, deadline_at)
+     values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+    [
+      uuidv4(),
+      workflowId,
+      name,
+      node.capabilityId,
+      node.dependsOn.length === 0 ? "ready" : "pending",
+      node.dependsOn,
+      node.payload || {},
+      DAG_MAX_ATTEMPTS,
+      CRITICAL_CAPS.has(node.capabilityId),
+      new Date(Date.now() + NODE_TIMEOUT_MS),
+    ]
+  );
+}
   await orchestrateWorkflow(workflowId);
   emitEvent("WORKFLOW_PUBLISHED", { workflowId, taskId, intent, nodes: Object.keys(nodes) });
   return { workflowId, taskId };
@@ -936,19 +938,18 @@ app.post("/v1/workflows/nodeResult", { preHandler: [rateLimitGuard, apiGuard] },
       throw new Error("duplicate_result");
     }
 
-    // Signature verification (required when agent has public_key)
-    if (node.agent_did) {
-      const keyRes = await client.query(`select public_key from agents where did = $1`, [node.agent_did]);
-      const pub = keyRes.rowCount ? keyRes.rows[0].public_key : null;
-      if (pub) {
-        if (!signature) {
-          throw new Error("missing_signature");
-        }
-        const payloadToSign = { workflowId, nodeId, result, error, metrics, resultId: incomingResultId };
-        const ok = verifySignature(pub, payloadToSign, signature);
-        if (!ok) {
-          throw new Error("invalid_signature");
-        }
+    // Signature verification (required when agent has public_key; optional otherwise)
+    const payloadToSign = { workflowId, nodeId, result, error, metrics, resultId: incomingResultId };
+    const keyRes = await client.query(`select public_key from agents where did = $1`, [node.agent_did]);
+    const expectedPub = keyRes.rowCount ? keyRes.rows[0].public_key : null;
+    const pubToUse = expectedPub || parsed.data.publicKey || null;
+    if (pubToUse) {
+      if (!signature) {
+        throw new Error("missing_signature");
+      }
+      const ok = verifySignature(pubToUse, payloadToSign, signature);
+      if (!ok) {
+        throw new Error("invalid_signature");
       }
     }
 
@@ -1206,7 +1207,8 @@ app.get("/v1/agents/overview", { preHandler: [rateLimitGuard, apiGuard] }, async
             coalesce(s.tasks_failed,0) as tasks_failed,
             coalesce(s.avg_latency_ms,0) as avg_latency_ms,
             hb.last_seen,
-            hb.availability_score
+            hb.availability_score,
+            (a.public_key is not null) as signed
        from agents a
   left join agent_reputation ar on ar.agent_did = a.did
   left join agent_stats s on s.agent_did = a.did
@@ -1223,7 +1225,8 @@ app.get("/v1/agents/:did", { preHandler: [rateLimitGuard, apiGuard] }, async (re
     `select a.did, a.endpoint,
             coalesce(ar.reputation, a.reputation, 0) as reputation,
             s.tasks_success, s.tasks_failed, s.avg_latency_ms,
-            hb.last_seen, hb.availability_score
+            hb.last_seen, hb.availability_score,
+            (a.public_key is not null) as signed
        from agents a
   left join agent_reputation ar on ar.agent_did = a.did
   left join agent_stats s on s.agent_did = a.did

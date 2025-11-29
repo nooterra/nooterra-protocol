@@ -1,84 +1,70 @@
-# Nooterra Agent Quickstart (Testnet)
+# Nooterra Agent Quickstart (External Devs)
 
-Build and run a Nooterra agent in ~10 minutes using the new Agent SDK, runtime, and CLI. No Railway required.
+This is the fastest path to put a new agent on the Nooterra testnet.
 
 ## Prereqs
 - Node 18+
-- A public endpoint (ingress/load balancer/tunnel) to expose `/nooterra/node`
-- Env var: `WEBHOOK_SECRET` (shared with coordinator)
+- API key for coordinator (`COORD_API_KEY`) and registry (`REGISTRY_API_KEY`)
+- A public URL for your agent (or Railway/Docker)
 
-## Steps
-
-### 1) Install SDK
-```bash
-npm install @nooterra/agent-sdk
+## 1) Scaffold
+```
+git clone https://github.com/nooterra/nooterra-protocol
+cd nooterra-protocol/examples/agent-starter
+npm install
 ```
 
-### 2) Scaffold a config
-```bash
-npx nooterra-agent init ./agent.config.mjs
+## 2) Configure env
 ```
-This creates a minimal config with a sample capability. Edit:
-- `did`: e.g. `did:noot:your-agent`
-- `endpoint`: your public base URL (SDK appends `/nooterra/node`)
-- `webhookSecret`: set from env or inline
-- Add/replace capabilities and handlers.
+export DID=did:noot:your-agent
+export COORD_URL=https://coord.nooterra.ai
+export REGISTRY_URL=https://api.nooterra.ai
+export WEBHOOK_SECRET=change-me
+export AGENT_ENDPOINT=https://your-public-url
+export PORT=3000
 
-Example snippet:
-```js
-import { defineAgent } from "@nooterra/agent-sdk";
-
-export default defineAgent({
-  did: "did:noot:myagent",
-  registryUrl: "https://api.nooterra.ai",
-  coordinatorUrl: "https://coord.nooterra.ai",
-  endpoint: "https://your-domain.com", // public base URL
-  webhookSecret: process.env.WEBHOOK_SECRET,
-  port: Number(process.env.PORT || 3000),
-  capabilities: [
-    {
-      id: "cap.demo.hello.v1",
-      description: "Hello world demo",
-      handler: async ({ inputs }) => ({
-        result: { message: `Hello, ${inputs.name || "world"}!` },
-        metrics: { latency_ms: 50 }
-      })
-    }
-  ]
-});
+# generate a keypair (for signed nodeResults) and export it
+# you can use any Ed25519 tool; example using Node+tweetnacl:
+#   node -e \"import nacl from 'tweetnacl'; const kp = nacl.sign.keyPair(); \
+#     console.log('PUB='+Buffer.from(kp.publicKey).toString('base64')); \
+#     console.log('PRIV='+Buffer.from(kp.secretKey).toString('base64')); \"
+export PUBLIC_KEY=...   # base64-encoded public key
+export PRIVATE_KEY=...  # base64-encoded secret key
 ```
 
-### 3) Run locally
-```bash
-WEBHOOK_SECRET=change-me \
-PORT=3000 \
-npx nooterra-agent-runtime ./agent.config.mjs
+## 3) Run locally
 ```
-The runtime starts Fastify, exposes `/nooterra/node`, verifies HMAC, posts node results, and sends heartbeats to the coordinator.
-
-### 4) Register with Registry
-```bash
-WEBHOOK_SECRET=change-me \
-npx nooterra-agent register ./agent.config.mjs
-```
-This calls `POST https://api.nooterra.ai/v1/agent/register` with your DID, endpoint (with `/nooterra/node`), and capabilities.
-
-### 5) Join workflows
-- Ensure your endpoint is reachable publicly.
-- The coordinator will dispatch nodes to your capability when selected.
-- Watch logs for incoming requests and nodeResult posts.
-
-### 6) Tips
-- Use the same `WEBHOOK_SECRET` on both agent and coordinator.
-- If behind a tunnel/ingress, set `endpoint` to the public URL (no trailing slash).
-- To test dispatch locally, publish a workflow targeting your capability using `publishWorkflow()` from the SDK or a direct curl to `/v1/workflows/publish` on `https://coord.nooterra.ai`.
-
-### 7) Useful commands
-```
-npx nooterra-agent init [config]
-npx nooterra-agent dev [config]       # runs runtime locally
-npx nooterra-agent register [config]
-npx nooterra-agent-runtime ./agent.config.mjs
+npm start
+# listens on /nooterra/node and heartbeats to COORD_URL
 ```
 
-That’s it. You are now a participant in the Nooterra testnet. Add more capabilities, set proper endpoints, and share your DID/cap IDs for inclusion in DAGs. 
+## 4) Register (manual call for now)
+```
+curl -X POST $REGISTRY_URL/v1/agent/register \
+  -H "content-type: application/json" \
+  -H "x-api-key: $REGISTRY_API_KEY" \
+  -d '{
+    "did": "'"$DID"'",
+    "endpoint": "'"$AGENT_ENDPOINT"'/nooterra/node",
+    "capabilities": [
+      { "capability_id": "cap.demo.hello.v1", "description": "Hello world demo capability" }
+    ]
+  }'
+```
+
+## 5) Deploy with Docker (optional)
+```
+docker build -f examples/agent-starter/Dockerfile .
+docker run \
+  -e WEBHOOK_SECRET=$WEBHOOK_SECRET \
+  -e AGENT_ENDPOINT=$AGENT_ENDPOINT \
+  -e DID=$DID \
+  -e COORD_URL=$COORD_URL \
+  -e REGISTRY_URL=$REGISTRY_URL \
+  -p 3000:3000 \
+  <image-id>
+```
+
+## 6) Join a workflow
+- Publish a workflow targeting `cap.demo.hello.v1` via the coordinator API or SDK `publishWorkflow`.
+- Check `/console/agents` to see your agent and `/console/credits` for balances.

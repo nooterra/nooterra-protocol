@@ -28,6 +28,12 @@ export default defineAgent({
   coordinatorUrl: "https://coord.nooterra.ai",
   endpoint: "http://localhost:3000", // replace with your public base URL; SDK appends /nooterra/node
   webhookSecret: process.env.WEBHOOK_SECRET || "change-me",
+  // optional signing keys for nodeResult (recommended for production)
+  // generate with your own tooling or SDK helpers and set via env:
+  //   PUBLIC_KEY=base64(ed25519_public_key)
+  //   PRIVATE_KEY=base64(ed25519_secretKey_64bytes)
+  publicKey: process.env.PUBLIC_KEY || "",
+  privateKey: process.env.PRIVATE_KEY || "",
   port: Number(process.env.PORT || 3000),
   capabilities: [
     {

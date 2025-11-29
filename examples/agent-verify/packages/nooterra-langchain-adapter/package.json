@@ -1,0 +1,20 @@
+{
+  "name": "nooterra-langchain-adapter",
+  "version": "0.1.0",
+  "description": "Minimal LangChain-compatible tool wrapper for Nooterra",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "nooterra-core": "0.1.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  }
+}

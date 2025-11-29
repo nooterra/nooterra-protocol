@@ -14,6 +14,8 @@ const agentConfig = defineAgent({
   coordinatorUrl: coordUrl,
   endpoint: process.env.AGENT_ENDPOINT || "https://agent-rail-production.up.railway.app",
   webhookSecret,
+  publicKey: process.env.PUBLIC_KEY || "",
+  privateKey: process.env.PRIVATE_KEY || "",
   port,
   capabilities: [
     {

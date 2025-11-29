@@ -52,8 +52,8 @@ export interface AgentConfig {
   registryUrl: string;
   coordinatorUrl: string;
   webhookSecret: string;
-  publicKey?: string; // base64 or base58 ed25519 public key
-  privateKey?: string; // base64 or base58 ed25519 secret key (64-byte secretKey or 32-byte seed)
+  publicKey?: string; // base58 ed25519 (optional for ACARD signing)
+  privateKey?: string; // base58 ed25519 (optional for ACARD signing)
   capabilities: CapabilityConfig[];
   endpoint: string; // public base URL, must include scheme and host (no trailing slash)
   port?: number;
