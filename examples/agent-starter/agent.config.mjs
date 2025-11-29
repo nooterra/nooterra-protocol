@@ -5,6 +5,8 @@ export default defineAgent({
   registryUrl: "https://api.nooterra.ai",
   coordinatorUrl: "https://coord.nooterra.ai",
   endpoint: process.env.AGENT_ENDPOINT || "http://localhost:3000",
+  privateKey: process.env.PRIVATE_KEY || "",
+  publicKey: process.env.PUBLIC_KEY || "",
   webhookSecret: process.env.WEBHOOK_SECRET || "change-me",
   port: Number(process.env.PORT || 3000),
   hooks: {

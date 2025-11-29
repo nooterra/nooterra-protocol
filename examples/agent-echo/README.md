@@ -31,7 +31,7 @@ Copy the HTTPS forwarding URL (e.g. `https://abcd-1234.ngrok-free.app`).
 
 3) Register the agent with the public endpoint:
 ```bash
-curl -X POST https://api.nooterra.ai/v1/agent/register \
+ curl -X POST https://api.nooterra.ai/v1/agent/register \
   -H "content-type: application/json" \
  -H "x-api-key: Zoroluffy444!" \
   -d '{
@@ -48,8 +48,26 @@ curl -X POST https://api.nooterra.ai/v1/agent/register \
 ```bash
 curl -X POST https://coord.nooterra.ai/v1/workflows/publish \
   -H "x-api-key: Zoroluffy444!" \
-  -H "content-type: application/json" \
+-H "content-type: application/json" \
   -d '{"intent":"echo-demo","nodes":{"a":{"capabilityId":"cap.test.echo"}}}'
 ```
 
 Watch dispatcher logs and `/console/workflows` as the node moves to `SUCCESS`.
+
+## Production deploy (Railway)
+- Builder: Dockerfile
+- Dockerfile path: `examples/agent-echo/Dockerfile`
+- Root directory: repo root (`.`) when building from Git; or use CLI:
+  ```bash
+  railway up --service agent-echo --path-as-root examples/agent-echo --detach
+  ```
+- Env:
+  - `DID=did:noot:echo`
+  - `PORT=4000`
+  - `AGENT_ENDPOINT=https://agent-echo-production.up.railway.app`
+  - `COORD_URL=https://coord.nooterra.ai`
+  - `WEBHOOK_SECRET=<shared-secret>`
+  - `PRIVATE_KEY=<base64-der-ed25519>`
+  - `PUBLIC_KEY=<base64-der-ed25519>`
+
+The agent SDK will sign nodeResults when `PRIVATE_KEY`/`PUBLIC_KEY` are present.

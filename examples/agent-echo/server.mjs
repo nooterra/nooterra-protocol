@@ -4,13 +4,21 @@ const webhookSecret = process.env.WEBHOOK_SECRET || "";
 const agentDid = process.env.DID || "did:noot:echo";
 const port = Number(process.env.PORT || 4000);
 
+const coordUrl =
+  process.env.COORD_URL ||
+  process.env.INTERNAL_COORD_URL ||
+  (process.env.RAILWAY_ENVIRONMENT ? "http://nooterra-coordinator.railway.internal:3002" : "https://coord.nooterra.ai");
+
 const agentConfig = defineAgent({
   did: agentDid,
   registryUrl: process.env.REGISTRY_URL || "https://api.nooterra.ai",
-  coordinatorUrl: process.env.COORD_URL || "https://coord.nooterra.ai",
+  coordinatorUrl: coordUrl,
   endpoint: process.env.AGENT_ENDPOINT || "https://agent-echo-production.up.railway.app",
   webhookSecret,
   port,
+  // signing keypair for nodeResult (base64-encoded DER private/public)
+  privateKey: process.env.PRIVATE_KEY || "",
+  publicKey: process.env.PUBLIC_KEY || "",
   capabilities: [
     {
       id: "cap.test.echo",
@@ -24,7 +32,6 @@ const agentConfig = defineAgent({
       id: "cap.verify.generic.v1",
       description: "Generic verification stub (approves everything)",
       handler: async ({ inputs }) => {
-        // For now simply mark as verified; attach original payload if present.
         return {
           result: {
             verified: true,
