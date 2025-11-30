@@ -19,7 +19,23 @@ const REGISTRY_URL = process.env.REGISTRY_URL || "";
 const REGISTRY_API_KEY = process.env.REGISTRY_API_KEY || "";
 const RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_MAX || 60);
 const RATE_LIMIT_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS || 60_000);
-const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
+// Allow CORS from one or more origins.
+// - You can set CORS_ORIGIN to a single origin:
+//     CORS_ORIGIN=https://www.nooterra.ai
+// - Or multiple, comma-separated:
+//     CORS_ORIGIN=https://www.nooterra.ai,https://nooterra.ai
+//
+// Fastify's CORS plugin accepts a string or an array of origins, but the
+// Access-Control-Allow-Origin header itself must contain exactly one value
+// per response. We normalize any comma-separated env into an array so the
+// plugin can handle it correctly instead of emitting a raw CSV string.
+const CORS_ORIGIN_RAW = process.env.CORS_ORIGIN || "*";
+const CORS_ORIGIN =
+  CORS_ORIGIN_RAW.includes(",")
+    ? CORS_ORIGIN_RAW.split(",")
+        .map((o) => o.trim())
+        .filter((o) => o.length > 0)
+    : CORS_ORIGIN_RAW;
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "";
 const HEARTBEAT_TTL_MS = Number(process.env.HEARTBEAT_TTL_MS || 60_000);
 const DISPATCH_BATCH_MS = Number(process.env.DISPATCH_BATCH_MS || 1000);
