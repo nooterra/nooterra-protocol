@@ -38,7 +38,10 @@ const agentConfig = defineAgent({
       id: "cap.llm.hermes.chat.v1",
       description:
         "General-purpose chat completion using Hermes (free, OpenAI-compatible LLM via uncloseai)",
-      price_cents: Number(process.env.HERMES_PRICE_CENTS || 0),
+      // Free by default in Labs; set HERMES_PRICE_CREDITS if you want to charge
+      priceCredits: process.env.HERMES_PRICE_CREDITS
+        ? Number(process.env.HERMES_PRICE_CREDITS)
+        : undefined,
       handler: async ({ inputs }) => {
         const { prompt, messages, temperature, max_tokens } = inputs || {};
 
@@ -106,4 +109,3 @@ startAgentServer(agentConfig).then(() => {
   );
   console.log(`Endpoint (base): ${agentConfig.endpoint}`);
 });
-
