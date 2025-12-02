@@ -1864,6 +1864,136 @@ export function registerPlatformRoutes(app: FastifyInstance<any, any, any, any, 
     });
   });
 
+  // ==================
+  // HUGGINGFACE BULK IMPORT
+  // ==================
+
+  app.post("/v1/integrations/huggingface/import-models", async (request, reply) => {
+    const user = await getUserFromRequest(request, reply);
+    if (!user) return;
+
+    const schema = z.object({
+      task: z.string().optional(), // e.g., "text-generation", "summarization"
+      limit: z.number().int().min(1).max(200).default(50),
+      minDownloads: z.number().int().default(1000),
+    });
+
+    const parsed = schema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.status(400).send({ error: parsed.error.flatten() });
+    }
+
+    const { task, limit, minDownloads } = parsed.data;
+    const imported: string[] = [];
+
+    try {
+      const fetch = (await import("node-fetch")).default;
+      
+      // Fetch models from HuggingFace Hub
+      let url = `https://huggingface.co/api/models?sort=downloads&direction=-1&limit=${limit}`;
+      if (task) {
+        url += `&pipeline_tag=${encodeURIComponent(task)}`;
+      }
+
+      const hfRes = await fetch(url);
+      if (!hfRes.ok) {
+        return reply.status(500).send({ error: "HuggingFace API error" });
+      }
+
+      const models = await hfRes.json() as any[];
+      const REGISTRY_URL = process.env.REGISTRY_URL || "https://registry.nooterra.ai";
+
+      // Task to capability mapping
+      const taskToCapability: Record<string, string> = {
+        "text-generation": "cap.llm.generate",
+        "text2text-generation": "cap.llm.transform",
+        "summarization": "cap.text.summarize",
+        "translation": "cap.text.translate",
+        "question-answering": "cap.qa.answer",
+        "conversational": "cap.chat.conversation",
+        "text-classification": "cap.text.classify",
+        "sentiment-analysis": "cap.text.sentiment",
+        "image-classification": "cap.image.classify",
+        "object-detection": "cap.image.detect",
+        "image-to-text": "cap.image.caption",
+        "text-to-image": "cap.image.generate",
+        "automatic-speech-recognition": "cap.audio.transcribe",
+        "text-to-speech": "cap.audio.speak",
+        "feature-extraction": "cap.embedding.extract",
+      };
+
+      for (const model of models) {
+        if (model.downloads < minDownloads) continue;
+
+        const modelSlug = model.id.replace(/[^a-zA-Z0-9]/g, "_").toLowerCase();
+        const did = `did:noot:hf:${modelSlug.slice(0, 40)}`;
+        const pipelineTask = model.pipeline_tag || "text-generation";
+        const capBase = taskToCapability[pipelineTask] || `cap.hf.${pipelineTask.replace(/-/g, "_")}`;
+        const capabilityId = `${capBase}.${modelSlug.slice(0, 20)}.v1`;
+
+        // Calculate price based on model popularity
+        let price = 5;
+        if (model.downloads > 1000000) price = 25;
+        else if (model.downloads > 100000) price = 15;
+        else if (model.downloads > 10000) price = 10;
+
+        try {
+          await fetch(`${REGISTRY_URL}/v1/agent/register`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              did,
+              name: model.id.split("/").pop() || model.id,
+              endpoint: `https://api-inference.huggingface.co/models/${model.id}`,
+              walletAddress: user.address,
+              capabilities: [{
+                capabilityId,
+                description: `HuggingFace: ${model.id} (${pipelineTask})`,
+                tags: ["huggingface", pipelineTask, model.library_name || "transformers"],
+                price_cents: price,
+              }],
+            }),
+          });
+
+          imported.push(model.id);
+        } catch {}
+      }
+
+    } catch (err: any) {
+      app.log.error({ err }, "HF bulk import failed");
+      return reply.status(500).send({ error: "HuggingFace import failed" });
+    }
+
+    return reply.send({
+      success: true,
+      imported: imported.length,
+      models: imported,
+    });
+  });
+
+  // Get available HuggingFace tasks
+  app.get("/v1/integrations/huggingface/tasks", async (request, reply) => {
+    return reply.send({
+      tasks: [
+        { id: "text-generation", name: "Text Generation", description: "Generate text from prompts" },
+        { id: "text2text-generation", name: "Text-to-Text", description: "Transform text to text" },
+        { id: "summarization", name: "Summarization", description: "Summarize long texts" },
+        { id: "translation", name: "Translation", description: "Translate between languages" },
+        { id: "question-answering", name: "Question Answering", description: "Answer questions from context" },
+        { id: "conversational", name: "Conversational", description: "Chat/dialogue models" },
+        { id: "text-classification", name: "Text Classification", description: "Classify text into categories" },
+        { id: "sentiment-analysis", name: "Sentiment Analysis", description: "Detect sentiment in text" },
+        { id: "image-classification", name: "Image Classification", description: "Classify images" },
+        { id: "object-detection", name: "Object Detection", description: "Detect objects in images" },
+        { id: "image-to-text", name: "Image Captioning", description: "Generate captions for images" },
+        { id: "text-to-image", name: "Text to Image", description: "Generate images from text" },
+        { id: "automatic-speech-recognition", name: "Speech to Text", description: "Transcribe audio" },
+        { id: "text-to-speech", name: "Text to Speech", description: "Convert text to audio" },
+        { id: "feature-extraction", name: "Embeddings", description: "Extract text embeddings" },
+      ],
+    });
+  });
+
   // Bulk import from GitHub topic
   app.post("/v1/integrations/github/bulk-import", async (request, reply) => {
     const user = await getUserFromRequest(request, reply);
