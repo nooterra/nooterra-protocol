@@ -270,6 +270,12 @@ const apiGuard = async (request: Req, reply: Rep) => {
     return reply.status(401).send({ error: "Missing API key" });
   }
 
+  // Playground free tier - allows basic operations for demos
+  if (provided === "playground-free-tier") {
+    (request as any).auth = { isSuper: false, projectId: null, isPlayground: true };
+    return;
+  }
+
   // Super / legacy key path for Labs: if COORDINATOR_API_KEY matches, treat as super.
   if (API_KEY && API_KEY.toLowerCase() !== "none" && provided === API_KEY) {
     (request as any).auth = { isSuper: true, projectId: null };
