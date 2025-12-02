@@ -33,12 +33,57 @@ const RATE_LIMIT_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS || 60_000);
 // per response. We normalize any comma-separated env into an array so the
 // plugin can handle it correctly instead of emitting a raw CSV string.
 const CORS_ORIGIN_RAW = process.env.CORS_ORIGIN || "*";
-const CORS_ORIGIN =
-  CORS_ORIGIN_RAW.includes(",")
-    ? CORS_ORIGIN_RAW.split(",")
-        .map((o) => o.trim())
-        .filter((o) => o.length > 0)
-    : CORS_ORIGIN_RAW;
+
+// Dynamic CORS origin handler to support Vercel preview URLs
+const CORS_ORIGIN = (origin: string | undefined, callback: (err: Error | null, allow?: boolean | string) => void) => {
+  // Allow requests with no origin (curl, server-to-server)
+  if (!origin) {
+    return callback(null, true);
+  }
+  
+  // Always allow these domains
+  const allowedOrigins = [
+    "https://nooterra.ai",
+    "https://www.nooterra.ai",
+    "http://localhost:3000",
+    "http://localhost:5173",
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:5173",
+  ];
+  
+  // Add any explicitly configured origins
+  if (CORS_ORIGIN_RAW && CORS_ORIGIN_RAW !== "*") {
+    CORS_ORIGIN_RAW.split(",").forEach((o) => {
+      const trimmed = o.trim();
+      if (trimmed && !allowedOrigins.includes(trimmed)) {
+        allowedOrigins.push(trimmed);
+      }
+    });
+  }
+  
+  // Check if origin is in allowed list
+  if (allowedOrigins.includes(origin)) {
+    return callback(null, origin);
+  }
+  
+  // Allow Vercel preview URLs (*.vercel.app)
+  if (origin.endsWith(".vercel.app")) {
+    return callback(null, origin);
+  }
+  
+  // Allow Railway preview URLs (*.up.railway.app)
+  if (origin.endsWith(".up.railway.app")) {
+    return callback(null, origin);
+  }
+  
+  // Allow all in development or if CORS_ORIGIN is "*"
+  if (CORS_ORIGIN_RAW === "*" || process.env.NODE_ENV !== "production") {
+    return callback(null, origin);
+  }
+  
+  // Reject unknown origins in production
+  return callback(new Error("Not allowed by CORS"), false);
+};
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "";
 const HERMES_BASE_URL = process.env.HERMES_BASE_URL || "";
 const HERMES_API_KEY = process.env.HERMES_API_KEY || "";
