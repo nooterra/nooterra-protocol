@@ -269,6 +269,17 @@ export async function migrate() {
 
   // optional price for capabilities (populated by registry; safe to add here)
   await pool.query(`alter table if exists capabilities add column if not exists price_cents int default 0;`);
+  
+  // Add unique constraint for capabilities upsert
+  await pool.query(`
+    do $$ begin
+      if not exists (
+        select 1 from pg_constraint where conname = 'capabilities_agent_did_capability_id_key'
+      ) then
+        alter table capabilities add constraint capabilities_agent_did_capability_id_key unique (agent_did, capability_id);
+      end if;
+    end $$;
+  `);
 
   await pool.query(`
     create table if not exists agent_endorsements (
