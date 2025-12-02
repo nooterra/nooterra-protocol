@@ -106,25 +106,38 @@ async function callOpenAI(req: AdapterRequest): Promise<AdapterResponse> {
   
   try {
     const apiKey = req.config?.api_key || process.env.OPENAI_API_KEY;
-    const baseUrl = req.endpoint.replace(/\/+$/, "");
+    let baseUrl = req.endpoint.replace(/\/+$/, "");
+    
+    // Handle endpoints that already include /chat/completions
+    const isFullUrl = baseUrl.includes("/chat/completions");
+    const apiUrl = isFullUrl ? baseUrl : `${baseUrl}/chat/completions`;
     
     // Determine if this is a chat or completion request
-    const messages = req.inputs.messages || [
-      { role: "user", content: req.inputs.query || req.inputs.prompt || req.inputs.text || JSON.stringify(req.inputs) }
-    ];
+    const userContent = req.inputs.query || req.inputs.prompt || req.inputs.text || 
+                       (typeof req.inputs === 'string' ? req.inputs : JSON.stringify(req.inputs));
+    const messages = req.inputs.messages || [{ role: "user", content: userContent }];
 
-    const response = await fetch(`${baseUrl}/chat/completions`, {
+    // Build request body - don't require model for uncloseai (they auto-select)
+    const requestBody: any = {
+      messages,
+      max_tokens: req.inputs.max_tokens || 1000,
+      temperature: req.inputs.temperature || 0.7,
+    };
+    
+    // Only add model if explicitly provided or not using uncloseai
+    if (req.inputs.model || req.config?.model) {
+      requestBody.model = req.inputs.model || req.config?.model;
+    } else if (!baseUrl.includes("unturf.com")) {
+      requestBody.model = "gpt-3.5-turbo";
+    }
+
+    const response = await fetch(apiUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
       },
-      body: JSON.stringify({
-        model: req.inputs.model || req.config?.model || "gpt-3.5-turbo",
-        messages,
-        max_tokens: req.inputs.max_tokens || 1000,
-        temperature: req.inputs.temperature || 0.7,
-      }),
+      body: JSON.stringify(requestBody),
     });
 
     if (!response.ok) {
