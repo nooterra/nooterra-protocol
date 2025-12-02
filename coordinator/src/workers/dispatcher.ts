@@ -2,6 +2,7 @@ import dotenv from "dotenv";
 import fetch from "node-fetch";
 import crypto from "crypto";
 import { pool, migrate } from "../db.js";
+import { callExternalAgent, detectAdapter } from "../adapters/index.js";
 
 dotenv.config();
 
@@ -17,6 +18,88 @@ function signPayload(body: string) {
 
 const PROTOCOL_FEE_BPS = Number(process.env.PROTOCOL_FEE_BPS || 30);
 const SYSTEM_PAYER = process.env.SYSTEM_PAYER || "did:noot:system";
+const COORD_RESULT_URL = process.env.COORD_URL || "http://localhost:3002";
+
+/**
+ * After an adapted call succeeds, check if dependent nodes are now ready
+ */
+async function triggerDependentNodes(workflowId: string, completedNodeId: string) {
+  try {
+    // Find nodes that depend on the completed node
+    const dependents = await pool.query(
+      `SELECT id, name, capability_id, depends_on, payload
+       FROM task_nodes 
+       WHERE workflow_id = $1 
+         AND status = 'pending' 
+         AND $2 = ANY(depends_on)`,
+      [workflowId, completedNodeId]
+    );
+    
+    for (const node of dependents.rows) {
+      // Check if ALL dependencies are now complete
+      const deps = node.depends_on as string[];
+      const allDepsComplete = await pool.query(
+        `SELECT COUNT(*) as complete_count 
+         FROM task_nodes 
+         WHERE workflow_id = $1 
+           AND name = ANY($2::text[])
+           AND status = 'success'`,
+        [workflowId, deps]
+      );
+      
+      const completeCount = Number(allDepsComplete.rows[0]?.complete_count || 0);
+      
+      if (completeCount === deps.length) {
+        // All dependencies complete! Mark this node as ready
+        await pool.query(
+          `UPDATE task_nodes SET status = 'ready', updated_at = now() WHERE id = $1`,
+          [node.id]
+        );
+        console.log(`[dispatcher] node ${node.name} is now ready (all deps complete)`);
+      }
+    }
+  } catch (err: any) {
+    console.error(`[dispatcher] triggerDependentNodes error: ${err.message}`);
+  }
+}
+
+/**
+ * Update workflow status based on node statuses
+ */
+async function updateWorkflowStatus(workflowId: string) {
+  try {
+    const wfStatus = await pool.query(
+      `SELECT
+        SUM(CASE WHEN status = 'failed' OR status = 'failed_timeout' THEN 1 ELSE 0 END) as failed,
+        SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) as success,
+        COUNT(*) as total
+       FROM task_nodes WHERE workflow_id = $1`,
+      [workflowId]
+    );
+    
+    const { failed, success, total } = wfStatus.rows[0];
+    
+    if (Number(failed) > 0) {
+      await pool.query(
+        `UPDATE workflows SET status = 'failed', updated_at = now() WHERE id = $1`,
+        [workflowId]
+      );
+    } else if (Number(success) === Number(total)) {
+      await pool.query(
+        `UPDATE workflows SET status = 'success', updated_at = now() WHERE id = $1`,
+        [workflowId]
+      );
+      console.log(`[dispatcher] workflow ${workflowId} completed successfully!`);
+    } else {
+      await pool.query(
+        `UPDATE workflows SET status = 'running', updated_at = now() WHERE id = $1`,
+        [workflowId]
+      );
+    }
+  } catch (err: any) {
+    console.error(`[dispatcher] updateWorkflowStatus error: ${err.message}`);
+  }
+}
 
 async function processOnce() {
   // Timeout stale dispatched nodes
@@ -69,6 +152,57 @@ async function processOnce() {
     try {
       await pool.query(`update dispatch_queue set status = 'sending' where id = $1`, [job.id]);
       console.log(`[dispatcher] sending job=${job.id} node=${job.node_id} url=${job.target_url} attempt=${attempt}`);
+      
+      // Detect if this is an external API that needs an adapter
+      const adapterType = detectAdapter(job.target_url);
+      const isNativeAgent = adapterType === "webhook" && !job.target_url.includes("huggingface") && !job.target_url.includes("unturf");
+      
+      if (!isNativeAgent) {
+        // Use adapter for external APIs (HuggingFace, OpenAI-compatible, Replicate, etc.)
+        console.log(`[dispatcher] using adapter=${adapterType} for job=${job.id}`);
+        
+        const adapterResult = await callExternalAgent({
+          endpoint: job.target_url,
+          capability: job.payload?.capabilityId || "",
+          inputs: job.payload?.inputs || {},
+          config: {}, // Could be loaded from agent/capability metadata
+        });
+        
+        if (adapterResult.success) {
+          console.log(`[dispatcher] adapter success job=${job.id} latency=${adapterResult.latency_ms}ms`);
+          
+          // Post result back to coordinator as if the agent responded
+          const resultPayload = {
+            workflowId: job.workflow_id,
+            nodeId: job.node_id,
+            result: adapterResult.result,
+            metrics: {
+              latency_ms: adapterResult.latency_ms,
+              tokens_used: adapterResult.tokens_used || 0,
+            },
+          };
+          
+          // Update task_nodes directly for adapted calls
+          await pool.query(
+            `update task_nodes set status='success', result_payload=$1, result_hash=null, attempts=coalesce(attempts,0)+1, finished_at=now(), updated_at=now()
+             where workflow_id=$2 and name=$3`,
+            [adapterResult.result, job.workflow_id, job.node_id]
+          );
+          
+          // Check if any dependent nodes can now be enqueued
+          await triggerDependentNodes(job.workflow_id, job.node_id);
+          
+          // Update workflow status
+          await updateWorkflowStatus(job.workflow_id);
+          
+          await pool.query(`delete from dispatch_queue where id = $1`, [job.id]);
+          continue;
+        } else {
+          throw new Error(adapterResult.error || "Adapter call failed");
+        }
+      }
+      
+      // Native Nooterra agent - use standard dispatch
       const res = await fetch(job.target_url, { method: "POST", headers, body: bodyString });
       if (!res.ok) {
         // If this is a verification stub, treat any response as success to unblock DAGs.
