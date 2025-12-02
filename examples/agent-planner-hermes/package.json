@@ -1,0 +1,14 @@
+{
+  "name": "agent-planner-hermes",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "node server.mjs"
+  },
+  "dependencies": {
+    "@nooterra/agent-sdk": "file:../../packages/nooterra-agent-sdk",
+    "dotenv": "^16.4.7",
+    "node-fetch": "^3.3.2",
+    "openai": "^4.76.2"
+  }
+}

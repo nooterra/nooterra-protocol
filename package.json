@@ -6,12 +6,14 @@
     "packages/nooterra-core",
     "packages/nooterra-langchain-adapter",
     "packages/nooterra-agent-sdk",
-    "cli/nooterra-agent"
+    "cli/nooterra-agent",
+    "cli/nooterra-workflow"
   ],
   "scripts": {
     "build": "npm run build -w nooterra-core && npm run build -w nooterra-langchain-adapter && npm run build -w @nooterra/agent-sdk && npm run build -w nooterra-agent",
     "publish:core": "npm publish -w nooterra-core --access public",
     "publish:adapter": "npm publish -w nooterra-langchain-adapter --access public",
-    "nooterra-agent": "node cli/nooterra-agent/dist/bin/main.js"
+    "nooterra-agent": "node cli/nooterra-agent/dist/bin/main.js",
+    "nooterra-workflow": "node cli/nooterra-workflow/dist/bin/main.js"
   }
 }

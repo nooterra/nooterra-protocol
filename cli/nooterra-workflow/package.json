@@ -1,0 +1,20 @@
+{
+  "name": "nooterra-workflow",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "nooterra-workflow": "dist/bin/main.js"
+  },
+  "scripts": {
+    "build": "tsc -p ."
+  },
+  "dependencies": {
+    "@nooterra/agent-sdk": "file:../../packages/nooterra-agent-sdk"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  }
+}
+

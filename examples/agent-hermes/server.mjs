@@ -43,20 +43,38 @@ const agentConfig = defineAgent({
         ? Number(process.env.HERMES_PRICE_CREDITS)
         : undefined,
       handler: async ({ inputs }) => {
-        const { prompt, messages, temperature, max_tokens } = inputs || {};
+        const { prompt, messages, temperature, max_tokens, parents } = inputs || {};
 
-        const finalMessages =
-          messages && Array.isArray(messages) && messages.length > 0
-            ? messages
-            : [
-                {
-                  role: "user",
-                  content:
-                    typeof prompt === "string"
-                      ? prompt
-                      : "You are a helpful AI assistant.",
-                },
-              ];
+        // Build a chat history:
+        // - If explicit `messages` are provided, use them as-is.
+        // - Otherwise, synthesize a single user message from `prompt`
+        //   and, if available, a pretty-printed view of `parents`.
+        let finalMessages;
+
+        if (messages && Array.isArray(messages) && messages.length > 0) {
+          finalMessages = messages;
+        } else {
+          let baseContent =
+            typeof prompt === "string" && prompt.length
+              ? prompt
+              : "You are a helpful AI assistant.";
+
+          if (parents && typeof parents === "object") {
+            try {
+              const prettyParents = JSON.stringify(parents, null, 2);
+              baseContent += `\n\nContext from previous nodes:\n${prettyParents}`;
+            } catch {
+              // ignore JSON errors and fall back to baseContent only
+            }
+          }
+
+          finalMessages = [
+            {
+              role: "user",
+              content: baseContent,
+            },
+          ];
+        }
 
         const started = Date.now();
 

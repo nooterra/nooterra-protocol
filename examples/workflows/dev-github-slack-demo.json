@@ -1,0 +1,41 @@
+{
+  "intent": "dev-github-slack-demo",
+  "maxCents": 1000,
+  "nodes": {
+    "summarize_issue": {
+      "capabilityId": "cap.llm.hermes.chat.v1",
+      "dependsOn": [],
+      "payload": {
+        "prompt": "Summarize the following bug report into a concise description and detail block. Respond with JSON {\"title\": \"...\", \"body\": \"...\"}. Bug details: ${ENV:BUG_REPORT_TEXT}"
+      }
+    },
+    "title_with_qwen": {
+      "capabilityId": "cap.llm.qwen.coder.v1",
+      "dependsOn": ["summarize_issue"],
+      "payload": {
+        "prompt": "You are a coding assistant. Given the previous summary JSON from Hermes (parents.summarize_issue), generate a concise GitHub issue title only.",
+        "temperature": 0.3
+      }
+    },
+    "create_issue": {
+      "capabilityId": "cap.github.create_issue.v1",
+      "dependsOn": ["summarize_issue", "title_with_qwen"],
+      "payload": {
+        "repo": "${ENV:GITHUB_REPO}",
+        "title": "Use parents.title_with_qwen.content as title",
+        "body": "Use parents.summarize_issue.content as body",
+        "labels": ["auto", "nooterra"],
+        "token": "${ENV:GITHUB_TOKEN}"
+      }
+    },
+    "notify_ops": {
+      "capabilityId": "cap.slack.notify.v1",
+      "dependsOn": ["create_issue"],
+      "payload": {
+        "webhookUrl": "${ENV:SLACK_WEBHOOK_URL}",
+        "text": "Created GitHub issue from Nooterra workflow. Repository: ${ENV:GITHUB_REPO}"
+      }
+    }
+  }
+}
+

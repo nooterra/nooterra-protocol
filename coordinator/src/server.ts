@@ -5,12 +5,15 @@ import { z } from "zod";
 import { v4 as uuidv4 } from "uuid";
 import pino from "pino";
 import { pool, migrate } from "./db.js";
+import bcrypt from "bcryptjs";
+import jwt from "jsonwebtoken";
 import fetch from "node-fetch";
 import crypto from "crypto";
 import nacl from "tweetnacl";
 import { validateOutputSchema } from "./validation.js";
 import { listWorkflows } from "./list-workflows.js";
 import { startDispatcherLoop } from "./workers/dispatcher.js";
+import { registerPlatformRoutes } from "./platform.js";
 
 dotenv.config();
 
@@ -37,6 +40,14 @@ const CORS_ORIGIN =
         .filter((o) => o.length > 0)
     : CORS_ORIGIN_RAW;
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "";
+const HERMES_BASE_URL = process.env.HERMES_BASE_URL || "";
+const HERMES_API_KEY = process.env.HERMES_API_KEY || "";
+const HERMES_MODEL =
+  process.env.HERMES_MODEL ||
+  "adamo1139/Hermes-3-Llama-3.1-8B-FP8-Dynamic";
+const ENABLE_LLM_PLANNER =
+  (process.env.ENABLE_LLM_PLANNER || "").toLowerCase() === "true";
+const JWT_SECRET = process.env.JWT_SECRET || "nooterra-dev-secret";
 const HEARTBEAT_TTL_MS = Number(process.env.HEARTBEAT_TTL_MS || 60_000);
 const DISPATCH_BATCH_MS = Number(process.env.DISPATCH_BATCH_MS || 1000);
 const RETRY_BACKOFFS_MS = [0, 1000, 5000, 30000];
@@ -165,6 +176,9 @@ await app.register(cors, { origin: CORS_ORIGIN });
 
 await migrate();
 
+// Register platform routes for frontend features
+registerPlatformRoutes(app);
+
 // request/trace id propagation
 app.addHook("onRequest", async (request, reply) => {
   const rid =
@@ -188,6 +202,38 @@ app.addHook("onResponse", async (request, reply) => {
   });
 });
 
+// Helper: extract authenticated user via JWT for Console / management APIs
+type AuthenticatedUser = { id: number; email: string };
+
+async function getUserFromRequest(request: Req, reply: Rep): Promise<AuthenticatedUser | null> {
+  const header = (request.headers["authorization"] as string | undefined) || "";
+  const token = header.startsWith("Bearer ") ? header.slice("Bearer ".length).trim() : "";
+  if (!token) {
+    await reply.status(401).send({ error: "Unauthorized" });
+    return null;
+  }
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET) as { userId: number; email: string };
+    if (!decoded?.userId) {
+      await reply.status(401).send({ error: "Unauthorized" });
+      return null;
+    }
+    const res = await pool.query<{ id: number; email: string }>(
+      `select id, email from users where id = $1`,
+      [decoded.userId]
+    );
+    if (!res.rowCount) {
+      await reply.status(401).send({ error: "Unauthorized" });
+      return null;
+    }
+    return { id: res.rows[0].id, email: res.rows[0].email };
+  } catch (err) {
+    app.log.warn({ err }, "JWT verification failed");
+    await reply.status(401).send({ error: "Unauthorized" });
+    return null;
+  }
+}
+
 const rateBucket = new Map<string, { count: number; resetAt: number }>();
 const rateLimitGuard = async (request: Req, reply: Rep) => {
   const ip =
@@ -209,19 +255,405 @@ const rateLimitGuard = async (request: Req, reply: Rep) => {
 };
 
 const apiGuard = async (request: Req, reply: Rep) => {
-  // Allow heartbeat and nodeResult without API key so agents can report liveness/results
+  // Allow heartbeat and nodeResult without API key so agents can report liveness/results.
+  // Also allow auth endpoints to be accessed without x-api-key (they use JWT instead).
   const path = request.url || "";
-  if (path.startsWith("/v1/heartbeat") || path.startsWith("/v1/workflows/nodeResult")) return;
-  if (!API_KEY || API_KEY.toLowerCase() === "none") return;
+  if (
+    path.startsWith("/v1/heartbeat") ||
+    path.startsWith("/v1/workflows/nodeResult") ||
+    path.startsWith("/auth/")
+  ) {
+    return;
+  }
   const method = request.method?.toUpperCase() || "";
   const isWrite = ["POST", "PUT", "PATCH", "DELETE"].includes(method);
-  if (isWrite) {
-    const provided = request.headers["x-api-key"];
-    if (provided !== API_KEY) {
-      return reply.status(401).send({ error: "Unauthorized" });
-    }
+  if (!isWrite) return;
+
+  const provided = request.headers["x-api-key"] as string | undefined;
+
+  if (!provided) {
+    return reply.status(401).send({ error: "Missing API key" });
   }
+
+  // Super / legacy key path for Labs: if COORDINATOR_API_KEY matches, treat as super.
+  if (API_KEY && API_KEY.toLowerCase() !== "none" && provided === API_KEY) {
+    (request as any).auth = { isSuper: true, projectId: null };
+    return;
+  }
+
+  // Project-scoped key: look up in api_keys by hash.
+  const hash = crypto.createHash("sha256").update(provided).digest("hex");
+  const res = await pool.query(
+    `select ak.project_id
+       from api_keys ak
+       join projects p on p.id = ak.project_id
+      where ak.key_hash = $1
+        and ak.revoked_at is null`,
+    [hash]
+  );
+  if (!res.rowCount) {
+    return reply.status(401).send({ error: "Unauthorized" });
+  }
+  (request as any).auth = { isSuper: false, projectId: res.rows[0].project_id as number };
 };
+
+// ---- Auth & project / API key management ----
+
+app.post("/auth/signup", async (request, reply) => {
+  const parsed = signupSchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.status(400).send({ error: parsed.error.flatten(), message: "Invalid signup payload" });
+  }
+  const { email, password } = parsed.data;
+  try {
+    const hash = await bcrypt.hash(password, 10);
+    const client = await pool.connect();
+    try {
+      await client.query("begin");
+      const userRes = await client.query<{ id: number }>(
+        `insert into users (email, password_hash) values ($1, $2) returning id`,
+        [email.toLowerCase(), hash]
+      );
+      const userId = userRes.rows[0].id;
+      const payerDid = `did:noot:project:${uuidv4()}`;
+      await client.query(
+        `insert into projects (owner_user_id, name, payer_did) values ($1,$2,$3)`,
+        [userId, "Default", payerDid]
+      );
+      await client.query(
+        `insert into ledger_accounts (owner_did, balance)
+         values ($1, 0)
+         on conflict (owner_did) do update set owner_did = excluded.owner_did`,
+        [payerDid]
+      );
+      await client.query("commit");
+    } catch (err: any) {
+      await client.query("rollback");
+      if ((err as any).code === "23505") {
+        return reply.status(409).send({ error: "Email already registered" });
+      }
+      throw err;
+    } finally {
+      client.release();
+    }
+    return reply.send({ ok: true });
+  } catch (err: any) {
+    app.log.error({ err }, "signup failed");
+    return reply.status(500).send({ error: "signup_failed" });
+  }
+});
+
+app.post("/auth/login", async (request, reply) => {
+  const parsed = loginSchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.status(400).send({ error: parsed.error.flatten(), message: "Invalid login payload" });
+  }
+  const { email, password } = parsed.data;
+  try {
+    const res = await pool.query<{ id: number; email: string; password_hash: string }>(
+      `select id, email, password_hash from users where email = $1`,
+      [email.toLowerCase()]
+    );
+    if (!res.rowCount) {
+      return reply.status(401).send({ error: "Invalid credentials" });
+    }
+    const user = res.rows[0];
+    const ok = await bcrypt.compare(password, user.password_hash);
+    if (!ok) {
+      return reply.status(401).send({ error: "Invalid credentials" });
+    }
+    const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: "7d" });
+    return reply.send({ token });
+  } catch (err: any) {
+    app.log.error({ err }, "login failed");
+    return reply.status(500).send({ error: "login_failed" });
+  }
+});
+
+app.get("/auth/me", async (request, reply) => {
+  const user = await getUserFromRequest(request, reply);
+  if (!user) return;
+  try {
+    const projRes = await pool.query<{ id: number; name: string; payer_did: string; created_at: Date }>(
+      `select id, name, payer_did, created_at from projects where owner_user_id = $1 order by created_at asc`,
+      [user.id]
+    );
+    return reply.send({
+      id: user.id,
+      email: user.email,
+      projects: projRes.rows.map((p) => ({
+        id: p.id,
+        name: p.name,
+        payerDid: p.payer_did,
+        createdAt: p.created_at,
+      })),
+    });
+  } catch (err: any) {
+    app.log.error({ err }, "auth/me failed");
+    return reply.status(500).send({ error: "me_failed" });
+  }
+});
+
+app.post("/v1/api-keys", async (request, reply) => {
+  const user = await getUserFromRequest(request, reply);
+  if (!user) return;
+  const parsed = createApiKeySchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.status(400).send({ error: parsed.error.flatten(), message: "Invalid payload" });
+  }
+  const { projectId, label } = parsed.data;
+  try {
+    const projRes = await pool.query<{ id: number }>(
+      `select id from projects where id = $1 and owner_user_id = $2`,
+      [projectId, user.id]
+    );
+    if (!projRes.rowCount) {
+      return reply.status(404).send({ error: "Project not found" });
+    }
+    const rawKey = crypto.randomBytes(24).toString("base64url");
+    const keyHash = crypto.createHash("sha256").update(rawKey).digest("hex");
+    const res = await pool.query<{ id: number }>(
+      `insert into api_keys (project_id, key_hash, label) values ($1,$2,$3) returning id`,
+      [projectId, keyHash, label || null]
+    );
+    return reply.send({
+      id: res.rows[0].id,
+      projectId,
+      label: label || null,
+      key: rawKey,
+    });
+  } catch (err: any) {
+    app.log.error({ err }, "create api key failed");
+    return reply.status(500).send({ error: "api_key_create_failed" });
+  }
+});
+
+app.get("/v1/api-keys", async (request, reply) => {
+  const user = await getUserFromRequest(request, reply);
+  if (!user) return;
+  try {
+    const res = await pool.query<{
+      id: number;
+      project_id: number;
+      label: string | null;
+      created_at: Date;
+      revoked_at: Date | null;
+    }>(
+      `select ak.id, ak.project_id, ak.label, ak.created_at, ak.revoked_at
+         from api_keys ak
+         join projects p on p.id = ak.project_id
+        where p.owner_user_id = $1
+        order by ak.created_at desc`,
+      [user.id]
+    );
+    return reply.send({
+      apiKeys: res.rows.map((k) => ({
+        id: k.id,
+        projectId: k.project_id,
+        label: k.label,
+        createdAt: k.created_at,
+        revokedAt: k.revoked_at,
+      })),
+    });
+  } catch (err: any) {
+    app.log.error({ err }, "list api keys failed");
+    return reply.status(500).send({ error: "api_key_list_failed" });
+  }
+});
+
+app.delete("/v1/api-keys/:id", async (request, reply) => {
+  const user = await getUserFromRequest(request, reply);
+  if (!user) return;
+  const id = Number((request.params as any).id);
+  if (!Number.isFinite(id) || id <= 0) {
+    return reply.status(400).send({ error: "Invalid id" });
+  }
+  try {
+    const res = await pool.query<{ id: number }>(
+      `update api_keys ak
+          set revoked_at = now()
+         from projects p
+        where ak.id = $1
+          and ak.project_id = p.id
+          and p.owner_user_id = $2
+        returning ak.id`,
+      [id, user.id]
+    );
+    if (!res.rowCount) {
+      return reply.status(404).send({ error: "Not found" });
+    }
+    return reply.send({ ok: true });
+  } catch (err: any) {
+    app.log.error({ err }, "revoke api key failed");
+    return reply.status(500).send({ error: "api_key_revoke_failed" });
+  }
+});
+
+app.get("/v1/projects", async (request, reply) => {
+  const user = await getUserFromRequest(request, reply);
+  if (!user) return;
+  try {
+    const res = await pool.query<{ id: number; name: string; payer_did: string; created_at: Date }>(
+      `select id, name, payer_did, created_at from projects where owner_user_id = $1 order by created_at asc`,
+      [user.id]
+    );
+    return reply.send({
+      projects: res.rows.map((p) => ({
+        id: p.id,
+        name: p.name,
+        payerDid: p.payer_did,
+        createdAt: p.created_at,
+      })),
+    });
+  } catch (err: any) {
+    app.log.error({ err }, "list projects failed");
+    return reply.status(500).send({ error: "project_list_failed" });
+  }
+});
+
+app.get("/v1/projects/:id/policy", async (request, reply) => {
+  const user = await getUserFromRequest(request, reply);
+  if (!user) return;
+  const id = Number((request.params as any).id);
+  if (!Number.isFinite(id) || id <= 0) {
+    return reply.status(400).send({ error: "Invalid project id" });
+  }
+  try {
+    const projRes = await pool.query<{ id: number }>(
+      `select id from projects where id = $1 and owner_user_id = $2`,
+      [id, user.id]
+    );
+    if (!projRes.rowCount) {
+      return reply.status(404).send({ error: "Project not found" });
+    }
+    const polRes = await pool.query<{ rules: any }>(
+      `select rules from policies where project_id = $1`,
+      [id]
+    );
+    if (!polRes.rowCount) {
+      return reply.send({ projectId: id, rules: null });
+    }
+    return reply.send({ projectId: id, rules: polRes.rows[0].rules || null });
+  } catch (err: any) {
+    app.log.error({ err }, "get policy failed");
+    return reply.status(500).send({ error: "policy_get_failed" });
+  }
+});
+
+app.put("/v1/projects/:id/policy", async (request, reply) => {
+  const user = await getUserFromRequest(request, reply);
+  if (!user) return;
+  const id = Number((request.params as any).id);
+  if (!Number.isFinite(id) || id <= 0) {
+    return reply.status(400).send({ error: "Invalid project id" });
+  }
+  const parsed = policySchema.safeParse(request.body || {});
+  if (!parsed.success) {
+    return reply.status(400).send({ error: parsed.error.flatten(), message: "Invalid policy payload" });
+  }
+  const rules = parsed.data;
+  try {
+    const projRes = await pool.query<{ id: number }>(
+      `select id from projects where id = $1 and owner_user_id = $2`,
+      [id, user.id]
+    );
+    if (!projRes.rowCount) {
+      return reply.status(404).send({ error: "Project not found" });
+    }
+    await pool.query(
+      `insert into policies (project_id, rules, updated_at)
+         values ($1,$2,now())
+         on conflict (project_id)
+         do update set rules = excluded.rules, updated_at = now()`,
+      [id, rules]
+    );
+    return reply.send({ ok: true, projectId: id, rules });
+  } catch (err: any) {
+    app.log.error({ err }, "update policy failed");
+    return reply.status(500).send({ error: "policy_update_failed" });
+  }
+});
+
+app.get("/v1/projects/:id/usage", async (request, reply) => {
+  const user = await getUserFromRequest(request, reply);
+  if (!user) return;
+  const id = Number((request.params as any).id);
+  const windowDays = Number(((request.query as any)?.windowDays as string) || "30");
+  if (!Number.isFinite(id) || id <= 0) {
+    return reply.status(400).send({ error: "Invalid project id" });
+  }
+  const days = !Number.isFinite(windowDays) || windowDays <= 0 ? 30 : Math.min(windowDays, 365);
+  try {
+    const projRes = await pool.query<{ id: number; payer_did: string }>(
+      `select id, payer_did from projects where id = $1 and owner_user_id = $2`,
+      [id, user.id]
+    );
+    if (!projRes.rowCount) {
+      return reply.status(404).send({ error: "Project not found" });
+    }
+    const payerDid = projRes.rows[0].payer_did;
+    const accRes = await pool.query<{ id: number; balance: number; currency: string | null }>(
+      `select id, balance, currency from ledger_accounts where owner_did = $1`,
+      [payerDid]
+    );
+    if (!accRes.rowCount) {
+      return reply.send({
+        projectId: id,
+        payerDid,
+        windowDays: days,
+        balance: 0,
+        currency: "NCR",
+        totalDebits: 0,
+        byCapability: [],
+      });
+    }
+    const accountId = accRes.rows[0].id;
+    const balance = Number(accRes.rows[0].balance || 0);
+    const currency = accRes.rows[0].currency || "NCR";
+
+    const totalRes = await pool.query<{ total: string | null }>(
+      `select coalesce(sum(delta),0) as total
+         from ledger_events
+        where account_id = $1
+          and delta < 0
+          and created_at >= now() - ($2::int || ' days')::interval`,
+      [accountId, days]
+    );
+    const totalDebits = Math.abs(Number(totalRes.rows[0].total || 0));
+
+    const byCapRes = await pool.query<{ capability_id: string | null; total: string | null }>(
+      `select meta->>'capabilityId' as capability_id,
+              coalesce(sum(delta),0) as total
+         from ledger_events
+        where account_id = $1
+          and delta < 0
+          and reason = 'node_charge'
+          and created_at >= now() - ($2::int || ' days')::interval
+        group by meta->>'capabilityId'
+        order by meta->>'capabilityId'`,
+      [accountId, days]
+    );
+    const byCapability = byCapRes.rows
+      .filter((r) => r.capability_id)
+      .map((r) => ({
+        capabilityId: r.capability_id as string,
+        spend: Math.abs(Number(r.total || 0)),
+      }));
+
+    return reply.send({
+      projectId: id,
+      payerDid,
+      windowDays: days,
+      balance,
+      currency,
+      totalDebits,
+      byCapability,
+    });
+  } catch (err: any) {
+    app.log.error({ err }, "project usage failed");
+    return reply.status(500).send({ error: "usage_failed" });
+  }
+});
 
 const publishSchema = z.object({
   requesterDid: z.string().optional(),
@@ -265,6 +697,18 @@ const endorseSchema = z.object({
   weight: z.number().min(0).max(5).optional(),
   timestamp: z.string().optional(),
   signature: z.string(),
+});
+
+const signupSchema = z.object({
+  email: z.string().email(),
+  password: z.string().min(8).max(128),
+});
+
+const loginSchema = signupSchema;
+
+const createApiKeySchema = z.object({
+  projectId: z.coerce.number().int().positive(),
+  label: z.string().max(100).optional(),
 });
 
 // Simple PageRank over endorsements + feedback graph
@@ -361,6 +805,21 @@ const workflowPublishSchema = z.object({
       payload: z.record(z.any()).optional(),
     })
   ),
+});
+
+const workflowSuggestSchema = z.object({
+  intent: z.string().optional(),
+  description: z.string().min(5).max(2000),
+  maxCents: z.number().int().nonnegative().optional(),
+});
+
+const policySchema = z.object({
+  minReputation: z.number().min(0).max(1).optional(),
+  allowUnsigned: z.boolean().optional(),
+  allowedCapabilities: z.array(z.string()).optional(),
+  blockedCapabilities: z.array(z.string()).optional(),
+  allowedAgentDids: z.array(z.string()).optional(),
+  blockedAgentDids: z.array(z.string()).optional(),
 });
 
 const nodeResultSchema = z.object({
@@ -462,6 +921,431 @@ type WorkflowNode = {
   dependsOn: string[];
   payload?: Record<string, any>;
 };
+
+/**
+ * Call a registered planner agent (cap.plan.workflow.v1) directly.
+ * Uses the same dispatch contract (POST /nooterra/node with optional HMAC).
+ * Returns a parsed DAG or null on any error.
+ */
+async function planWithPlannerAgent(
+  intent: string | undefined,
+  description: string,
+  maxCents: number | undefined,
+  capsForPlanner: Array<{ capabilityId: string; description: string; price_cents: number | null }>
+): Promise<
+  | {
+      intent: string;
+      maxCents: number | null;
+      nodes: Record<string, { capabilityId: string; dependsOn?: string[]; payload?: Record<string, any> }>;
+    }
+  | null
+> {
+  try {
+    const agentRes = await pool.query<{
+      did: string;
+      endpoint: string;
+      public_key: string | null;
+      rep: number;
+      avail: number;
+    }>(
+      `select a.did, a.endpoint, a.public_key,
+              coalesce(ar.reputation, a.reputation, 0) as rep,
+              coalesce(hb.availability_score, 0) as avail
+         from agents a
+         join capabilities c on c.agent_did = a.did
+         left join agent_reputation ar on ar.agent_did = a.did
+         left join heartbeats hb on hb.agent_did = a.did
+        where c.capability_id = $1
+          and (hb.last_seen is null or hb.last_seen > now() - interval '${HEARTBEAT_TTL_MS} milliseconds')
+        order by coalesce(ar.reputation, a.reputation, 0) desc nulls last,
+                 coalesce(hb.availability_score, 0) desc nulls last
+        limit 5`,
+      ["cap.plan.workflow.v1"]
+    );
+    const candidates = agentRes.rows;
+    if (!candidates.length) return null;
+
+    const chosen = candidates[0];
+    const basePayload = {
+      workflowId: `planner-${uuidv4()}`,
+      nodeId: "plan",
+      capabilityId: "cap.plan.workflow.v1",
+      inputs: {
+        intent: intent || "",
+        description,
+        maxCents: maxCents ?? null,
+        capabilities: capsForPlanner,
+      },
+      eventId: uuidv4(),
+      timestamp: new Date().toISOString(),
+    };
+    const body = JSON.stringify(basePayload);
+    const signature = signPayload(body);
+    const url = chosen.endpoint.endsWith("/nooterra/node")
+      ? chosen.endpoint
+      : `${chosen.endpoint.replace(/\/$/, "")}/nooterra/node`;
+
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(signature ? { "x-nooterra-signature": signature } : {}),
+      },
+      body,
+    });
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => "");
+      app.log.error({ status: resp.status, body: text }, "planner agent HTTP error");
+      return null;
+    }
+    const data: any = await resp.json().catch(() => null);
+    const result = data?.result || data?.data || data;
+    if (!result || typeof result !== "object") return null;
+    const nodesRaw = result.nodes;
+    if (!nodesRaw || typeof nodesRaw !== "object") return null;
+
+    const nodes: Record<
+      string,
+      { capabilityId: string; dependsOn?: string[]; payload?: Record<string, any> }
+    > = {};
+    for (const [name, node] of Object.entries<any>(nodesRaw)) {
+      if (!name || typeof name !== "string") continue;
+      const capId = node.capabilityId;
+      if (typeof capId !== "string") continue;
+      const depends = Array.isArray(node.dependsOn)
+        ? node.dependsOn.filter((d: any) => typeof d === "string")
+        : [];
+      const payload =
+        node.payload && typeof node.payload === "object" ? node.payload : undefined;
+      // ensure cap exists
+      if (!capsForPlanner.some((c) => c.capabilityId === capId)) continue;
+      nodes[name] = { capabilityId: capId, dependsOn: depends, payload };
+    }
+    if (!Object.keys(nodes).length) return null;
+    return {
+      intent: result.intent || intent || "suggested",
+      maxCents:
+        typeof result.maxCents === "number"
+          ? result.maxCents
+          : maxCents ?? null,
+      nodes,
+    };
+  } catch (err) {
+    app.log.error({ err }, "planner agent call failed");
+    return null;
+  }
+}
+
+/**
+ * Optional LLM-based planner that uses Hermes (via UncloseAI) to propose
+ * a workflow DAG from free-form description + available capabilities.
+ *
+ * This is intentionally conservative:
+ * - Only enabled when ENABLE_LLM_PLANNER=true and Hermes creds are set.
+ * - Returns null on any error, so callers can safely fall back.
+ */
+async function planWithHermes(
+  intent: string | undefined,
+  description: string,
+  maxCents: number | undefined,
+  capabilities: Array<{ capabilityId: string; description: string; price_cents: number | null }>
+): Promise<
+  | {
+      intent: string;
+      maxCents: number | null;
+      nodes: Record<string, { capabilityId: string; dependsOn?: string[]; payload?: Record<string, any> }>;
+    }
+  | null
+> {
+  if (!ENABLE_LLM_PLANNER || !HERMES_BASE_URL || !HERMES_API_KEY) {
+    return null;
+  }
+  try {
+    const system = [
+      "You are a workflow planning agent for the Nooterra protocol.",
+      "You will be given:",
+      "- a high-level intent and description for a task,",
+      "- an optional max budget in NCR cents, and",
+      "- a list of available capabilities that agents can perform.",
+      "",
+      "Your job is to propose a multi-node workflow as a directed acyclic graph (DAG).",
+      "",
+      "Rules:",
+      "- Only use capabilityId values from the provided capabilities list.",
+      "- Each node must have:",
+      '    name (string, unique),',
+      '    capabilityId (string),',
+      '    dependsOn (array of node names; may be empty),',
+      "    payload (optional object with inputs for that capability).",
+      "- The graph must be acyclic.",
+      "- There should be between 1 and 8 nodes.",
+      "- Think step-by-step, then output ONLY a strict JSON object with this shape:",
+      "",
+      '{',
+      '  "intent": "string",',
+      '  "maxCents": number | null,',
+      '  "nodes": {',
+      '    "node_name": {',
+      '      "capabilityId": "cap.something.v1",',
+      '      "dependsOn": ["other_node_name"],',
+      '      "payload": { /* optional */ }',
+      '    },',
+      '    "another_node": { ... }',
+      '  }',
+      '}',
+      "",
+      "Do not include any explanation, comments, or Markdown.",
+    ].join("\n");
+
+    const userPayload = {
+      intent: intent || "",
+      description,
+      maxCents: maxCents ?? null,
+      capabilities: capabilities.map((c) => ({
+        capabilityId: c.capabilityId,
+        description: c.description,
+        price_cents: c.price_cents,
+      })),
+    };
+
+    const resp = await fetch(`${HERMES_BASE_URL.replace(/\/$/, "")}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${HERMES_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: HERMES_MODEL,
+        messages: [
+          { role: "system", content: system },
+          {
+            role: "user",
+            content: JSON.stringify(userPayload),
+          },
+        ],
+        temperature: 0.2,
+        max_tokens: 768,
+      }),
+    });
+
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => "");
+      app.log.error(
+        { status: resp.status, body: text },
+        "Hermes planner HTTP error"
+      );
+      return null;
+    }
+    const data: any = await resp.json().catch(() => null);
+    const content =
+      data?.choices?.[0]?.message?.content ??
+      data?.choices?.[0]?.message ??
+      null;
+    if (!content || typeof content !== "string") {
+      app.log.error({ content }, "Hermes planner returned no content");
+      return null;
+    }
+
+    let parsed: any;
+    try {
+      parsed = JSON.parse(content);
+    } catch (err) {
+      app.log.error({ err, content }, "Hermes planner JSON parse failed");
+      return null;
+    }
+    if (
+      !parsed ||
+      typeof parsed !== "object" ||
+      !parsed.nodes ||
+      typeof parsed.nodes !== "object"
+    ) {
+      app.log.error({ parsed }, "Hermes planner invalid structure");
+      return null;
+    }
+
+    const nodes: Record<
+      string,
+      { capabilityId: string; dependsOn?: string[]; payload?: Record<string, any> }
+    > = {};
+    for (const [name, node] of Object.entries<any>(parsed.nodes)) {
+      if (!name || typeof name !== "string") continue;
+      const capId = node.capabilityId;
+      if (typeof capId !== "string") continue;
+      const depends = Array.isArray(node.dependsOn)
+        ? node.dependsOn.filter((d: any) => typeof d === "string")
+        : [];
+      const payload =
+        node.payload && typeof node.payload === "object" ? node.payload : undefined;
+
+      // only allow capabilities that actually exist
+      if (!capabilities.some((c) => c.capabilityId === capId)) {
+        continue;
+      }
+      nodes[name] = { capabilityId: capId, dependsOn: depends, payload };
+    }
+
+    const nodeNames = Object.keys(nodes);
+    if (nodeNames.length === 0) {
+      app.log.warn("Hermes planner produced zero valid nodes, falling back");
+      return null;
+    }
+
+    return {
+      intent: parsed.intent || intent || "suggested",
+      maxCents:
+        typeof parsed.maxCents === "number"
+          ? parsed.maxCents
+          : maxCents ?? null,
+      nodes,
+    };
+  } catch (err) {
+    app.log.error({ err }, "Hermes planner exception");
+    return null;
+  }
+}
+
+async function suggestWorkflow(
+  intent: string | undefined,
+  description: string,
+  maxCents?: number
+) {
+  const text = `${intent || ""} ${description}`.toLowerCase();
+  const capsRes = await pool.query<{ capability_id: string; description: string | null; price_cents: number | null }>(
+    `select capability_id, description, price_cents from capabilities`
+  );
+  const caps = new Set(capsRes.rows.map((r) => r.capability_id));
+  const hasCap = (id: string) => caps.has(id);
+
+  // Try LLM-based planner first if enabled; fall back to heuristics if it fails.
+  const capsForPlanner = capsRes.rows.map((r) => ({
+    capabilityId: r.capability_id,
+    description: r.description || "",
+    price_cents: r.price_cents,
+  }));
+  // 1) Planner agent if available
+  const agentDraft = await planWithPlannerAgent(intent, description, maxCents, capsForPlanner);
+  if (agentDraft && Object.keys(agentDraft.nodes).length > 0) {
+    return agentDraft;
+  }
+  // 2) Inline Hermes planner (optional) if enabled
+  const llmDraft = await planWithHermes(intent, description, maxCents, capsForPlanner);
+  if (llmDraft && Object.keys(llmDraft.nodes).length > 0) {
+    return llmDraft;
+  }
+
+  const nodes: Record<
+    string,
+    { capabilityId: string; dependsOn?: string[]; payload?: Record<string, any> }
+  > = {};
+
+  const isLogistics =
+    text.includes("logistics") ||
+    text.includes("shipping") ||
+    text.includes("container") ||
+    text.includes("manifest") ||
+    text.includes("freight");
+
+  if (isLogistics) {
+    if (hasCap("cap.test.echo")) {
+      nodes["extract_manifest"] = {
+        capabilityId: "cap.test.echo",
+        dependsOn: [],
+        payload: {
+          container_id: "CNU1234567",
+          note: "Stub manifest extraction; replace payload as needed.",
+        },
+      };
+    }
+    if (hasCap("cap.weather.noaa.v1") && nodes["extract_manifest"]) {
+      nodes["weather_risk"] = {
+        capabilityId: "cap.weather.noaa.v1",
+        dependsOn: ["extract_manifest"],
+      };
+    }
+    if (hasCap("cap.customs.classify.v1") && nodes["extract_manifest"]) {
+      nodes["customs_classify"] = {
+        capabilityId: "cap.customs.classify.v1",
+        dependsOn: ["extract_manifest"],
+      };
+    }
+    if (hasCap("cap.rail.optimize.v1")) {
+      const deps: string[] = [];
+      if (nodes["weather_risk"]) deps.push("weather_risk");
+      if (nodes["customs_classify"]) deps.push("customs_classify");
+      if (!deps.length && nodes["extract_manifest"]) deps.push("extract_manifest");
+      nodes["rail_optimize"] = {
+        capabilityId: "cap.rail.optimize.v1",
+        dependsOn: deps,
+      };
+    }
+    if (hasCap("cap.slack.notify.v1") && nodes["rail_optimize"]) {
+      nodes["notify_ops"] = {
+        capabilityId: "cap.slack.notify.v1",
+        dependsOn: ["rail_optimize"],
+        payload: {
+          webhookUrl: "${ENV:SLACK_WEBHOOK_URL}",
+          text: "Logistics workflow completed ✅",
+        },
+      };
+    }
+  }
+
+  if (Object.keys(nodes).length === 0) {
+    // Fallback: single echo-like node using the most basic capability we have.
+    let capId = "cap.test.echo";
+    if (!hasCap(capId)) {
+      const first = caps.values().next();
+      capId = first.done ? "cap.test.echo" : first.value;
+    }
+    nodes["echo"] = {
+      capabilityId: capId,
+      dependsOn: [],
+      payload: { message: description },
+    };
+  }
+
+  return {
+    intent: intent || "suggested",
+    maxCents: maxCents ?? null,
+    nodes,
+  };
+}
+
+type Policy = {
+  minReputation?: number;
+  allowUnsigned?: boolean;
+  allowedCapabilities?: string[];
+  blockedCapabilities?: string[];
+  allowedAgentDids?: string[];
+  blockedAgentDids?: string[];
+};
+
+async function loadPolicyForWorkflow(workflowId: string): Promise<Policy | null> {
+  const wfRes = await pool.query<{ payer_did: string | null }>(
+    `select payer_did from workflows where id = $1`,
+    [workflowId]
+  );
+  if (!wfRes.rowCount) return null;
+  const payerDid = wfRes.rows[0].payer_did;
+  if (!payerDid) return null;
+  const projRes = await pool.query<{ id: number }>(
+    `select id from projects where payer_did = $1`,
+    [payerDid]
+  );
+  if (!projRes.rowCount) return null;
+  const projectId = projRes.rows[0].id;
+  const polRes = await pool.query<{ rules: any }>(
+    `select rules from policies where project_id = $1`,
+    [projectId]
+  );
+  if (!polRes.rowCount) return null;
+  const raw = polRes.rows[0].rules || {};
+  const parsed = policySchema.safeParse(raw);
+  if (!parsed.success) {
+    return null;
+  }
+  return parsed.data;
+}
 
 async function createWorkflow(
   intent: string | undefined,
@@ -565,9 +1449,11 @@ async function enqueueNode(node: any, workflowId: string) {
     }
   }
 
-  // select the top agent for the capability (simple MVP selection)
+  const policy = await loadPolicyForWorkflow(workflowId);
+
+  // select candidate agents for the capability
   const agentRes = await pool.query(
-    `select a.did, a.endpoint,
+    `select a.did, a.endpoint, a.public_key,
             coalesce(ar.reputation, a.reputation, 0) as rep,
             coalesce(hb.availability_score, 0) as avail
      from agents a
@@ -579,10 +1465,50 @@ async function enqueueNode(node: any, workflowId: string) {
        and (coalesce(ar.reputation, a.reputation, 0) >= $2)
      order by coalesce(ar.reputation, a.reputation, 0) desc nulls last,
               coalesce(hb.availability_score, 0) desc nulls last
-     limit 1`,
+     limit 20`,
     [node.capability_id, CRITICAL_CAPS.has(node.capability_id) ? MIN_REP_CRITICAL : 0]
   );
-  if (!agentRes.rowCount) {
+
+  const candidates = agentRes.rows as Array<{
+    did: string;
+    endpoint: string;
+    public_key: string | null;
+    rep: number;
+    avail: number;
+  }>;
+
+  const filtered = candidates.filter((row) => {
+    if (!policy) return true;
+    const did = row.did;
+    const capId = node.capability_id;
+    const rep = Number(row.rep || 0);
+    if (policy.minReputation != null && rep < policy.minReputation) return false;
+    if (policy.allowUnsigned === false && (!row.public_key || row.public_key.length === 0)) return false;
+    if (policy.allowedAgentDids && policy.allowedAgentDids.length > 0 && !policy.allowedAgentDids.includes(did)) {
+      return false;
+    }
+    if (policy.blockedAgentDids && policy.blockedAgentDids.includes(did)) return false;
+    const matchesPattern = (patterns?: string[]) => {
+      if (!patterns || patterns.length === 0) return false;
+      return patterns.some((p) => {
+        if (p === capId) return true;
+        if (p.endsWith(".*")) {
+          const prefix = p.slice(0, -2);
+          return capId.startsWith(prefix);
+        }
+        return false;
+      });
+    };
+    if (policy.allowedCapabilities && policy.allowedCapabilities.length > 0 && !matchesPattern(policy.allowedCapabilities)) {
+      return false;
+    }
+    if (matchesPattern(policy.blockedCapabilities)) return false;
+    return true;
+  });
+
+  const chosen = filtered[0];
+
+  if (!chosen) {
     app.log.error({ capability: node.capability_id, workflowId, node: node.name }, "no agent available for cap");
     // if this is a verify node and no verifier registered, fall back to automatic success
     if (node.capability_id === "cap.verify.generic.v1") {
@@ -607,8 +1533,8 @@ async function enqueueNode(node: any, workflowId: string) {
     emitEvent("NODE_FAILED", { workflowId, nodeId: node.name, reason: "no agent" });
     return;
   }
-  const target = agentRes.rows[0].endpoint;
-  const agentDid = agentRes.rows[0].did;
+  const target = chosen.endpoint;
+  const agentDid = chosen.did;
   const dispatchKey = `${workflowId}:${node.name}:${node.attempts || 0}`;
   await pool.query(
     `insert into dispatch_queue (task_id, workflow_id, node_id, event, target_url, payload, attempts, next_attempt, status, dispatch_key)
@@ -876,6 +1802,23 @@ app.get("/v1/ledger/:agentDid/history", { preHandler: [rateLimitGuard, apiGuard]
 });
 
 // ---- Workflow endpoints ----
+app.post("/v1/workflows/suggest", { preHandler: [rateLimitGuard, apiGuard] }, async (request, reply) => {
+  const parsed = workflowSuggestSchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply
+      .status(400)
+      .send({ error: parsed.error.flatten(), message: "Invalid suggest payload" });
+  }
+  const { intent, description, maxCents } = parsed.data;
+  try {
+    const draft = await suggestWorkflow(intent, description, maxCents);
+    return reply.send({ draft });
+  } catch (err: any) {
+    app.log.error({ err }, "workflow suggest failed");
+    return reply.status(500).send({ error: "suggest_failed" });
+  }
+});
+
 app.post("/v1/workflows/publish", { preHandler: [rateLimitGuard, apiGuard] }, async (request, reply) => {
   const parsed = workflowPublishSchema.safeParse(request.body);
   if (!parsed.success) {
@@ -920,7 +1863,25 @@ app.post("/v1/workflows/publish", { preHandler: [rateLimitGuard, apiGuard] }, as
       payload: node.payload,
     };
   }
-  const { workflowId, taskId } = await createWorkflow(intent, wfNodes, payerDid, maxCents);
+  // Determine effective payer DID based on API key's project (if any).
+  let effectivePayerDid = payerDid || SYSTEM_PAYER;
+  const authCtx = (request as any).auth as { isSuper?: boolean; projectId?: number | null } | undefined;
+  if (authCtx && !authCtx.isSuper && authCtx.projectId) {
+    const res = await pool.query<{ payer_did: string }>(
+      `select payer_did from projects where id = $1`,
+      [authCtx.projectId]
+    );
+    if (!res.rowCount) {
+      return reply.status(400).send({ error: "Project not found for API key" });
+    }
+    const projectPayer = res.rows[0].payer_did;
+    if (payerDid && payerDid !== projectPayer) {
+      return reply.status(403).send({ error: "payerDid does not belong to this project" });
+    }
+    effectivePayerDid = projectPayer;
+  }
+
+  const { workflowId, taskId } = await createWorkflow(intent, wfNodes, effectivePayerDid, maxCents);
   return reply.send({ workflowId, taskId, nodes: Object.keys(nodes) });
 });
 

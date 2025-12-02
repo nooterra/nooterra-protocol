@@ -1,0 +1,32 @@
+{
+  "intent": "logistics-slack-demo",
+  "payerDid": "did:noot:demo:payer",
+  "maxCents": 1000,
+  "nodes": {
+    "extract_manifest": {
+      "capabilityId": "cap.test.echo",
+      "payload": { "container_id": "CNU1234567" }
+    },
+    "weather_risk": {
+      "capabilityId": "cap.weather.noaa.v1",
+      "dependsOn": ["extract_manifest"]
+    },
+    "customs_classify": {
+      "capabilityId": "cap.customs.classify.v1",
+      "dependsOn": ["extract_manifest"]
+    },
+    "rail_optimize": {
+      "capabilityId": "cap.rail.optimize.v1",
+      "dependsOn": ["weather_risk", "customs_classify"]
+    },
+    "notify_ops": {
+      "capabilityId": "cap.slack.notify.v1",
+      "dependsOn": ["rail_optimize"],
+      "payload": {
+        "webhookUrl": "${ENV:SLACK_WEBHOOK_URL}",
+        "text": "Logistics workflow completed. Rail plan computed."
+      }
+    }
+  }
+}
+

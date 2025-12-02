@@ -1,0 +1,14 @@
+{
+  "name": "nooterra-agent-qwen",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "node server.mjs"
+  },
+  "dependencies": {
+    "@nooterra/agent-sdk": "file:../../packages/nooterra-agent-sdk",
+    "openai": "^4.77.0"
+  }
+}
+
