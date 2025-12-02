@@ -1971,6 +1971,82 @@ export function registerPlatformRoutes(app: FastifyInstance<any, any, any, any, 
     });
   });
 
+  // Import specialized HuggingFace agents (curated list)
+  app.post("/v1/integrations/huggingface/import-specialized", async (request, reply) => {
+    const user = await getUserFromRequest(request, reply);
+    if (!user) return;
+
+    const { SPECIALIZED_CATEGORIES, getAllSpecializedModels } = await import("./adapters/specialized-agents.js");
+    
+    const schema = z.object({
+      categories: z.array(z.string()).optional(), // e.g., ["vision", "audio"]
+    });
+
+    const parsed = schema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.status(400).send({ error: parsed.error.flatten() });
+    }
+
+    const { categories } = parsed.data;
+    const allModels = getAllSpecializedModels();
+    const modelsToImport = categories && categories.length > 0
+      ? allModels.filter(m => categories.includes(m.category))
+      : allModels;
+
+    const imported: string[] = [];
+    const REGISTRY_URL = process.env.REGISTRY_URL || "https://registry.nooterra.ai";
+
+    for (const model of modelsToImport) {
+      const modelSlug = model.modelId.replace(/[^a-zA-Z0-9]/g, "_").toLowerCase();
+      const did = `did:noot:hf:${modelSlug.slice(0, 40)}`;
+
+      try {
+        const fetch = (await import("node-fetch")).default;
+        await fetch(`${REGISTRY_URL}/v1/agent/register`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            did,
+            name: model.name,
+            endpoint: `https://api-inference.huggingface.co/models/${model.modelId}`,
+            walletAddress: user.address,
+            capabilities: [{
+              capabilityId: model.capability,
+              description: model.description,
+              tags: [...model.tags, "specialized", model.category],
+              price_cents: 10, // Specialized models cost more
+            }],
+          }),
+        });
+
+        imported.push(model.modelId);
+      } catch {}
+    }
+
+    return reply.send({
+      success: true,
+      imported: imported.length,
+      models: imported,
+      totalAvailable: allModels.length,
+    });
+  });
+
+  // Get specialized categories
+  app.get("/v1/integrations/huggingface/specialized-categories", async (request, reply) => {
+    const { SPECIALIZED_CATEGORIES, EXAMPLE_WORKFLOWS } = await import("./adapters/specialized-agents.js");
+    
+    return reply.send({
+      categories: SPECIALIZED_CATEGORIES.map(c => ({
+        id: c.id,
+        name: c.name,
+        description: c.description,
+        emoji: c.emoji,
+        modelCount: c.topModels.length,
+      })),
+      exampleWorkflows: EXAMPLE_WORKFLOWS,
+    });
+  });
+
   // Get available HuggingFace tasks
   app.get("/v1/integrations/huggingface/tasks", async (request, reply) => {
     return reply.send({
