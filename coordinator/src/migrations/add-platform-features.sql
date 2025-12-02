@@ -237,3 +237,21 @@ CREATE INDEX IF NOT EXISTS agent_deployments_user_idx ON agent_deployments(user_
 CREATE INDEX IF NOT EXISTS agent_deployments_did_idx ON agent_deployments(did);
 CREATE INDEX IF NOT EXISTS agent_deployments_status_idx ON agent_deployments(status);
 
+-- GitHub imports (auto-imported agents from GitHub repos)
+CREATE TABLE IF NOT EXISTS github_imports (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id int REFERENCES users(id) ON DELETE SET NULL,
+  did text UNIQUE NOT NULL,
+  repo_url text NOT NULL,
+  name text NOT NULL,
+  description text,
+  language text,
+  capabilities jsonb DEFAULT '[]',
+  stars int DEFAULT 0,
+  is_active boolean DEFAULT true,
+  last_synced_at timestamptz,
+  created_at timestamptz DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS github_imports_user_idx ON github_imports(user_id);
+CREATE INDEX IF NOT EXISTS github_imports_did_idx ON github_imports(did);
+

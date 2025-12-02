@@ -1797,6 +1797,170 @@ export function registerPlatformRoutes(app: FastifyInstance<any, any, any, any, 
   });
 
   // ==================
+  // GITHUB IMPORT (Bulk import agents from GitHub repos)
+  // ==================
+
+  const githubImportSchema = z.object({
+    repoUrl: z.string().url(),
+    name: z.string(),
+    description: z.string().optional(),
+    capabilities: z.array(z.string()),
+    language: z.string().optional(),
+  });
+
+  app.post("/v1/integrations/github/import", async (request, reply) => {
+    const user = await getUserFromRequest(request, reply);
+    if (!user) return;
+
+    const parsed = githubImportSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.status(400).send({ error: parsed.error.flatten() });
+    }
+
+    const { repoUrl, name, description, capabilities, language } = parsed.data;
+    const agentId = uuidv4();
+    const did = `did:noot:github:${agentId.slice(0, 12)}`;
+
+    // Register as agent in the registry
+    try {
+      const fetch = (await import("node-fetch")).default;
+      const REGISTRY_URL = process.env.REGISTRY_URL || "https://registry.nooterra.ai";
+      
+      await fetch(`${REGISTRY_URL}/v1/agent/register`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          did,
+          name,
+          endpoint: repoUrl, // GitHub URL as endpoint (will need wrapper)
+          walletAddress: user.address,
+          capabilities: capabilities.map((capId, i) => ({
+            capabilityId: capId,
+            description: description || `Capability from ${name}`,
+            tags: ["github", language?.toLowerCase() || "unknown"].filter(Boolean),
+            price_cents: 10,
+          })),
+        }),
+      });
+    } catch (err: any) {
+      app.log.error({ err }, "Failed to register GitHub agent");
+    }
+
+    // Save to database
+    await pool.query(
+      `INSERT INTO github_imports (id, user_id, did, repo_url, name, description, language, capabilities, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())`,
+      [agentId, user.id, did, repoUrl, name, description, language, JSON.stringify(capabilities)]
+    );
+
+    return reply.send({
+      success: true,
+      agent: {
+        did,
+        name,
+        repoUrl,
+        capabilities,
+      },
+    });
+  });
+
+  // Bulk import from GitHub topic
+  app.post("/v1/integrations/github/bulk-import", async (request, reply) => {
+    const user = await getUserFromRequest(request, reply);
+    if (!user) return;
+
+    const schema = z.object({
+      topic: z.string(),
+      limit: z.number().int().min(1).max(100).default(20),
+    });
+
+    const parsed = schema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.status(400).send({ error: parsed.error.flatten() });
+    }
+
+    const { topic, limit } = parsed.data;
+    const imported: string[] = [];
+
+    try {
+      const fetch = (await import("node-fetch")).default;
+      
+      // Search GitHub for repos with this topic
+      const searchRes = await fetch(
+        `https://api.github.com/search/repositories?q=topic:${encodeURIComponent(topic)}&sort=stars&per_page=${limit}`,
+        {
+          headers: {
+            "Accept": "application/vnd.github.v3+json",
+            "User-Agent": "Nooterra-Agent-Importer",
+          },
+        }
+      );
+
+      if (!searchRes.ok) {
+        return reply.status(500).send({ error: "GitHub API error" });
+      }
+
+      const searchData = await searchRes.json() as any;
+      const repos = searchData.items || [];
+
+      const REGISTRY_URL = process.env.REGISTRY_URL || "https://registry.nooterra.ai";
+
+      for (const repo of repos) {
+        const agentId = uuidv4();
+        const did = `did:noot:github:${agentId.slice(0, 12)}`;
+        
+        // Auto-detect capabilities
+        const capabilities: string[] = [];
+        const topics = repo.topics || [];
+        
+        if (topics.includes("llm") || topics.includes("language-model")) {
+          capabilities.push("cap.llm.inference.v1");
+        }
+        if (topics.includes("chatbot") || topics.includes("conversational-ai")) {
+          capabilities.push("cap.chat.conversation.v1");
+        }
+        if (topics.includes("agent") || topics.includes("ai-agent")) {
+          capabilities.push("cap.agent.autonomous.v1");
+        }
+        if (capabilities.length === 0) {
+          capabilities.push(`cap.github.${repo.name.replace(/[^a-z0-9]/gi, "_").toLowerCase()}.v1`);
+        }
+
+        try {
+          await fetch(`${REGISTRY_URL}/v1/agent/register`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              did,
+              name: repo.name,
+              endpoint: repo.html_url,
+              walletAddress: user.address,
+              capabilities: capabilities.map(capId => ({
+                capabilityId: capId,
+                description: repo.description || `Agent from ${repo.full_name}`,
+                tags: ["github", repo.language?.toLowerCase() || "unknown", ...topics.slice(0, 3)],
+                price_cents: 10,
+              })),
+            }),
+          });
+
+          imported.push(repo.full_name);
+        } catch {}
+      }
+
+    } catch (err: any) {
+      app.log.error({ err }, "Bulk import failed");
+      return reply.status(500).send({ error: "Bulk import failed" });
+    }
+
+    return reply.send({
+      success: true,
+      imported: imported.length,
+      repos: imported,
+    });
+  });
+
+  // ==================
   // AGENT DEPLOYMENT (Vercel-style hosting)
   // ==================
 
