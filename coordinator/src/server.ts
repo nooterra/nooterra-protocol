@@ -2501,7 +2501,13 @@ app.post("/v1/admin/update-reputation", { preHandler: [rateLimitGuard] }, async 
   }
   
   try {
+    // Update both tables to ensure reputation is reflected
     await pool.query(`UPDATE agents SET reputation = $1 WHERE did = $2`, [reputation, did]);
+    await pool.query(`
+      INSERT INTO agent_reputation (agent_did, reputation, updated_at)
+      VALUES ($1, $2, NOW())
+      ON CONFLICT (agent_did) DO UPDATE SET reputation = $2, updated_at = NOW()
+    `, [did, reputation]);
     return reply.send({ ok: true, did, reputation });
   } catch (err: any) {
     app.log.error({ err }, "Failed to update reputation");
