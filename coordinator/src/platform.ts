@@ -1606,7 +1606,7 @@ export function registerPlatformRoutes(app: FastifyInstance<any, any, any, any, 
 
     const { platform, config } = parsed.data;
     const integrationId = uuidv4();
-    let name = platform;
+    let name: string = platform;
     let agentsImported = 0;
 
     // Platform-specific setup
