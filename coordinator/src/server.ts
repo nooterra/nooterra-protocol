@@ -2379,6 +2379,111 @@ app.get("/v1/events/stream", async (_req, reply) => {
   });
 });
 
+// Admin: Sync agents from registry
+app.post("/v1/admin/sync-agents", { preHandler: [rateLimitGuard] }, async (request, reply) => {
+  // Simple auth check - require API key
+  const provided = request.headers["x-api-key"] as string | undefined;
+  if (!API_KEY || provided !== API_KEY) {
+    return reply.status(401).send({ error: "Unauthorized" });
+  }
+  
+  if (!REGISTRY_URL) {
+    return reply.status(400).send({ error: "REGISTRY_URL not configured" });
+  }
+  
+  try {
+    const fetch = (await import("node-fetch")).default;
+    
+    // Fetch capabilities from registry's discover endpoint
+    const res = await fetch(`${REGISTRY_URL}/v1/capabilities?limit=500`);
+    if (!res.ok) {
+      // Try alternate endpoint
+      const res2 = await fetch(`${REGISTRY_URL}/v1/discover?limit=500`);
+      if (!res2.ok) {
+        return reply.status(502).send({ error: "Failed to fetch from registry" });
+      }
+      const data = await res2.json() as any;
+      
+      // Sync each agent/capability to local database
+      let synced = 0;
+      for (const row of data.results || []) {
+        // Upsert agent
+        await pool.query(`
+          INSERT INTO agents (did, name, endpoint, reputation, availability_score)
+          VALUES ($1, $2, $3, $4, $5)
+          ON CONFLICT (did) DO UPDATE SET 
+            endpoint = EXCLUDED.endpoint,
+            reputation = EXCLUDED.reputation,
+            availability_score = EXCLUDED.availability_score
+        `, [row.did, row.did.split(':').pop(), row.endpoint, row.reputation || 0, row.availability || 0]);
+        
+        // Upsert capability
+        await pool.query(`
+          INSERT INTO capabilities (agent_did, capability_id, description, tags, price_cents)
+          VALUES ($1, $2, $3, $4, $5)
+          ON CONFLICT (agent_did, capability_id) DO UPDATE SET
+            description = EXCLUDED.description,
+            tags = EXCLUDED.tags,
+            price_cents = EXCLUDED.price_cents
+        `, [row.did, row.capabilityId, row.description, row.tags || [], row.price_cents || 0]);
+        
+        synced++;
+      }
+      
+      return reply.send({ ok: true, synced });
+    }
+    
+    const data = await res.json() as any;
+    return reply.send({ ok: true, synced: 0, data });
+  } catch (err: any) {
+    app.log.error({ err }, "Failed to sync agents");
+    return reply.status(500).send({ error: err.message });
+  }
+});
+
+// Admin: Direct agent registration (bypass registry)
+app.post("/v1/admin/register-agent", { preHandler: [rateLimitGuard] }, async (request, reply) => {
+  const provided = request.headers["x-api-key"] as string | undefined;
+  if (!API_KEY || provided !== API_KEY) {
+    return reply.status(401).send({ error: "Unauthorized" });
+  }
+  
+  const body = request.body as any;
+  const { did, name, endpoint, capabilities } = body;
+  
+  if (!did || !endpoint || !capabilities?.length) {
+    return reply.status(400).send({ error: "Missing required fields: did, endpoint, capabilities" });
+  }
+  
+  try {
+    // Insert agent
+    await pool.query(`
+      INSERT INTO agents (did, name, endpoint, reputation, availability_score)
+      VALUES ($1, $2, $3, 0.5, 1)
+      ON CONFLICT (did) DO UPDATE SET 
+        name = EXCLUDED.name,
+        endpoint = EXCLUDED.endpoint
+    `, [did, name || did.split(':').pop(), endpoint]);
+    
+    // Insert capabilities
+    for (const cap of capabilities) {
+      await pool.query(`
+        INSERT INTO capabilities (agent_did, capability_id, description, tags, price_cents)
+        VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (agent_did, capability_id) DO UPDATE SET
+          description = EXCLUDED.description,
+          tags = EXCLUDED.tags,
+          price_cents = EXCLUDED.price_cents
+      `, [did, cap.capabilityId, cap.description, cap.tags || [], cap.price_cents || 0]);
+    }
+    
+    return reply.send({ ok: true, registered: capabilities.length });
+  } catch (err: any) {
+    app.log.error({ err }, "Failed to register agent");
+    return reply.status(500).send({ error: err.message });
+  }
+});
+
 app.get("/health", async (_req, reply) => {
   try {
     await pool.query("select 1");
