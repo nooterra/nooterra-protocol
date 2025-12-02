@@ -2486,6 +2486,29 @@ app.post("/v1/admin/delete-agents", { preHandler: [rateLimitGuard] }, async (req
   }
 });
 
+// Admin: Update agent reputation
+app.post("/v1/admin/update-reputation", { preHandler: [rateLimitGuard] }, async (request, reply) => {
+  const provided = request.headers["x-api-key"] as string | undefined;
+  if (!API_KEY || provided !== API_KEY) {
+    return reply.status(401).send({ error: "Unauthorized" });
+  }
+  
+  const body = request.body as any;
+  const { did, reputation } = body;
+  
+  if (!did || reputation === undefined) {
+    return reply.status(400).send({ error: "Missing required fields: did, reputation" });
+  }
+  
+  try {
+    await pool.query(`UPDATE agents SET reputation = $1 WHERE did = $2`, [reputation, did]);
+    return reply.send({ ok: true, did, reputation });
+  } catch (err: any) {
+    app.log.error({ err }, "Failed to update reputation");
+    return reply.status(500).send({ error: err.message });
+  }
+});
+
 // Admin: Direct agent registration (bypass registry)
 app.post("/v1/admin/register-agent", { preHandler: [rateLimitGuard] }, async (request, reply) => {
   const provided = request.headers["x-api-key"] as string | undefined;
